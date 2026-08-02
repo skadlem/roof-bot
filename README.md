@@ -1,5 +1,7 @@
 # Roof Bot
 
+[![CI](https://github.com/skadlem/roof-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/skadlem/roof-bot/actions/workflows/ci.yml)
+
 WhatsApp bot for roofing installation leads. Talks to customers in Russian, collects lead details (roofing type, area, phone number), saves leads and sends follow-ups to warm leads.
 
 ## How it works
@@ -31,7 +33,16 @@ pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Point the WhatsApp webhook at `https://<your-domain>/webhook`.
+Point the WhatsApp webhook at `https://<your-domain>/webhook`. Running locally — expose with a tunnel (`ngrok http 8000`) and use the ngrok URL in the Meta dashboard; update it there if the URL changes.
+
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+All tests are offline — external services (Gemini, WhatsApp, Google Sheets) are mocked. CI runs them on every push and pull request.
 
 ## Data files
 
