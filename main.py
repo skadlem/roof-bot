@@ -176,9 +176,22 @@ OWNER_PHONE_NUMBER = os.getenv("OWNER_PHONE_NUMBER")
 # ЭТО НЕ WA_TOKEN. Нужен для проверки подписи входящих вебхуков.
 WA_APP_SECRET = os.getenv("WA_APP_SECRET")
 
-# Google Sheets
-gc = gspread.service_account(filename="google_credentials.json")
-sheet = gc.open_by_key("11vKc3-d5zhX1-0wnua3blinCh4R6RJBi555JOhHz218").sheet1
+# Google Sheets — ленивая инициализация: подключение происходит при ПЕРВОМ
+# обращении (add_to_google_sheets), а не при старте. Так бот не падает при
+# запуске, если google_credentials.json недоступен/битый, а сетевой сбой при
+# экспорте заказа ловится общим try/except ниже.
+_sheet = None
+_sheet_lock = threading.Lock()
+
+
+def get_sheet():
+    global _sheet
+    with _sheet_lock:
+        if _sheet is None:
+            gc = gspread.service_account(filename="google_credentials.json")
+            _sheet = gc.open_by_key("11vKc3-d5zhX1-0wnua3blinCh4R6RJBi555JOhHz218").sheet1
+        return _sheet
+
 
 # Создаем папку для логов, если её нет
 if not os.path.exists("chats_logs"):
@@ -217,7 +230,7 @@ def add_to_google_sheets(order_data):
         order_data.get("address", "Самовывоз"),
     ]
     try:
-        sheet.append_row(row)
+        get_sheet().append_row(row)
     except Exception as e:
         print(f"[GOOGLE SHEETS ERROR] {e}")
 

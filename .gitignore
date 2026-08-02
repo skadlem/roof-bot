@@ -12,3 +12,4 @@ seen_messages.json
 venv/
 __pycache__/
 *.pyc
+.pytest_cache/
