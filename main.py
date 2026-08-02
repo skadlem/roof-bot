@@ -5,7 +5,6 @@ import hmac
 import hashlib
 import asyncio
 import threading
-from collections import deque
 import requests
 import gspread
 import google.generativeai as genai
@@ -15,8 +14,8 @@ from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from rag import retrieve as rag_retrieve
-from rag.prompts import build_rag_message
+from rag.agent import gemini_rate_limiter, get_model, load_prices, run_agent
+from rag.prompts import build_bot_system_prompt
 
 LEADS_FILE = "open_leads.json"
 
@@ -90,7 +89,7 @@ open_leads = load_leads()
 # --- ДЕДУПЛИКАЦИЯ ВЕБХУКОВ ---
 # Meta может повторно доставить один и тот же вебхук (сетевые ретраи), и тогда одно
 # и то же сообщение клиента обработается дважды: клиент получит два одинаковых
-# ответа, а в create_order может уйти задвоенный заказ. Храним ID уже обработанных
+# ответа, а в таблицу может уйти задвоенный лид. Храним ID уже обработанных
 # сообщений на диске (переживает рестарт сервера) и отбрасываем повторы.
 SEEN_MESSAGES_FILE = "seen_messages.json"
 SEEN_MESSAGE_TTL = 24 * 60 * 60  # сутки — с запасом перекрывает окно ретраев Meta
@@ -152,39 +151,15 @@ def is_duplicate_message(message_id: str | None) -> bool:
 load_dotenv()
 
 
-def load_prices():
-    try:
-        with open("prices.json", "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"Не удалось загрузить prices.json: {e}")
-        return {}
-
-
-# Загружаем цены при старте
+# Загружаем цены при старте (load_prices переехал в rag/agent.py — его же
+# использует инструмент lookup_pricing, чтобы не держать две копии прайса)
 PRICES = load_prices()
 prices_text = "\n".join([f"- {k}: {v} тг за кв.м" for k, v in PRICES.items()])
 
 # --- БАЗА ЗНАНИЙ (RAG) ---
 # Коллекция ChromaDB собирается rag/ingest.py из kb/*.md и Google Sheets.
-# Сборка сообщения с контекстом — rag/prompts.py; порог близости там же.
-KB_TOP_K = 3
-
-
-def build_message_with_kb(user_message, client_id):
-    """Подставляет в сообщение клиента факты из RAG-базы (rag/, ChromaDB).
-
-    Чанки ниже порога близости (rag.prompts.RAG_SIMILARITY_THRESHOLD)
-    отбрасываются; контекста нет — бот не угадывает, а отвечает по правилу
-    системного промпта («уточню у менеджера»).
-    """
-    try:
-        hits = rag_retrieve.retrieve(user_message, client_id, k=KB_TOP_K)
-        return build_rag_message(user_message, hits)
-    except Exception as e:
-        print(f"[RAG RETRIEVE ERROR] {client_id}: {e}")
-        return user_message
-
+# Контекст на первый ход агента подмешивает rag.agent.run_agent (первый ход
+# агент-цикла — это шаг 2: retrieve → build_rag_message, порог в rag/prompts.py).
 
 app = FastAPI()
 
@@ -194,11 +169,13 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 WA_TOKEN = os.getenv("WA_TOKEN")
 WA_PHONE_ID = os.getenv("WA_PHONE_ID")
 VERIFY_TOKEN = os.getenv("WA_VERIFY_TOKEN")
-OWNER_PHONE_NUMBER = os.getenv("OWNER_PHONE_NUMBER")
 
 # Секрет приложения Meta (App Dashboard -> Settings -> Basic -> App Secret).
 # ЭТО НЕ WA_TOKEN. Нужен для проверки подписи входящих вебхуков.
 WA_APP_SECRET = os.getenv("WA_APP_SECRET")
+
+# Телефон владельца: уведомление о новом лиде (шаблон new_order_notification)
+OWNER_PHONE_NUMBER = os.getenv("OWNER_PHONE_NUMBER")
 
 # Google Sheets — ленивая инициализация: подключение происходит при ПЕРВОМ
 # обращении (add_to_google_sheets), а не при старте. Так бот не падает при
@@ -260,6 +237,16 @@ def add_to_google_sheets(order_data):
         print(f"[GOOGLE SHEETS ERROR] {e}")
 
 
+def _save_lead_to_sheets(order_data):
+    """Хук записи лида для агент-цикла (rag.agent.run_agent).
+
+    Таблица и уведомление владельцу: create_lead вызывает хук только при
+    успешной валидации, так что сюда попадают только настоящие лиды.
+    """
+    add_to_google_sheets(order_data)
+    send_whatsapp_to_owner(order_data)
+
+
 def download_whatsapp_media(media_id: str):
     """Скачивает медиафайл (аудио) с серверов WhatsApp"""
     url = f"https://graph.facebook.com/v18.0/{media_id}"
@@ -283,26 +270,6 @@ def download_whatsapp_media(media_id: str):
 
 
 # --- ФУНКЦИЯ ОТПРАВКИ СООБЩЕНИЙ WHATSAPP ---
-def send_whatsapp_message(phone_number: str, text: str) -> None:
-    url = f"https://graph.facebook.com/v18.0/{WA_PHONE_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WA_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone_number,
-        "type": "text",
-        "text": {"body": text},
-    }
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=10)
-        if resp.status_code >= 400:
-            print(f"[WA ERROR] {resp.status_code} {resp.text}")
-    except requests.RequestException as e:
-        print(f"[WA EXCEPTION] {e}")
-
-
 def send_whatsapp_template_message(phone_number: str, template_name: str, body_params: list[str]):
     url = f"https://graph.facebook.com/v18.0/{WA_PHONE_ID}/messages"
     headers = {
@@ -329,9 +296,9 @@ def send_whatsapp_template_message(phone_number: str, template_name: str, body_p
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=10)
         if resp.status_code >= 400:
-            print(f"[WA TEMPLATE ERROR] {resp.status_code} {resp.text}")
+            print(f"[WA ERROR] {resp.status_code} {resp.text}")
     except requests.RequestException as e:
-        print(f"[WA TEMPLATE EXCEPTION] {e}")
+        print(f"[WA EXCEPTION] {e}")
 
 
 def send_whatsapp_to_owner(order_data):
@@ -339,7 +306,7 @@ def send_whatsapp_to_owner(order_data):
         print("[OWNER_PHONE_NUMBER MISSING]")
         return
 
-    # допустим, шаблон new_order_notification выглядит как:
+    # шаблон new_order_notification:
     # "Новый заказ: {{1}} (телефон {{2}}), материал {{3}}, цвет {{4}}, площадь {{5}} м², цена {{6}} тг, адрес {{7}}."
     title = order_data.get("name", "Не указано")
     details = (
@@ -349,153 +316,39 @@ def send_whatsapp_to_owner(order_data):
         f"площадь: {order_data.get('area', 'Не указана')} м², "
         f"цена: {order_data.get('price', 'Не указана')} тг, "
         f"адрес: {order_data.get('address', 'Самовывоз')}."
-        )
+    )
     params = [title, details]
     send_whatsapp_template_message(OWNER_PHONE_NUMBER, "new_order_notification", params)
 
 
-# --- ЛОГИКА GEMINI (SYSTEM PROMPT & FUNCTIONS) ---
-
-SYSTEM_PROMPT = f"""
-Ты — топовый эксперт и менеджер по продажам компании "МеталлКровля". Клиент может отправлять голосовые сообщения. 
-Твоя цель — провести клиента по технике SPIN-продаж: диагностика → раскрытие боли → презентация-зеркало → мягкая отработка → закрытие на маленький шаг.
-
-ПРАВИЛО ПЕРВОГО СООБЩЕНИЯ:
-- Если это ПЕРВОЕ твое сообщение в диалоге, начни с очень короткого представления:
-  "Вы обратились в компанию МеталлКровля, я виртуальный менеджер по кровле."
-- После этой одной фразы сразу задай первый диагностический вопрос.
-- ВО ВСЕХ последующих сообщениях не представляйся повторно.
-
-СТИЛЬ ОБЩЕНИЯ (СТРОГО):
-- Пиши КАК В МЕССЕНДЖЕРЕ. 1-3 предложения максимум.
-- В ОДНОМ сообщении СТРОГО ОДИН вопрос. Никогда не задавай несколько вопросов сразу.
-- ЗАПРЕЩЕНО использовать списки, буллиты, абзацы и эмодзи. Только простой короткий текст.
-- Обосновывай вопросы ("спрашиваю, потому что...") — это выглядит как экспертиза, а не допрос.
-- Никогда не имитируй искусственную срочность ("акция только сегодня").
-
-ПРАЙС-ЛИСТ (цена за 1 кв.м):
-{prices_text}
-
-БАЗА ЗНАНИЙ:
-Отвечай на фактические вопросы клиента (услуги, сроки, доставка, гарантии) строго на основе прайс-листа выше и контекста из базы знаний, который приходит в сообщении. НЕ выдумывай цены, услуги, сроки, зоны доставки или гарантии. Если клиент спрашивает факт, которого нет ни в прайсе, ни в контексте базы знаний, скажи, что уточнишь у менеджера, и предложи передать контакт менеджера. Никогда не называй выдуманные цифры.
-
-АЛГОРИТМ РАБОТЫ:
-
-ЭТАП 1: ДИАГНОСТИКА (Снимает ощущение впаривания)
-Никогда не начинай с цены. Задавай вопросы по цепочке (по одному за раз):
-1. Что за объект (дом/коммерция/промышленное)?
-2. Этап стройки (коробка без крыши / меняете старую / течет ремонт)?
-3. Площадь и примерная конфигурация (скаты, сложная геометрия)?
-4. Сроки (есть ли дедлайн, когда нужно закрыть)?
-
-ЭТАП 2: РАСКРЫТИЕ БОЛИ (Клиент продает себе сам)
-Узнай, что уже не устроило у других. Спроси: "Скорее всего вы уже с парой кровельщиков пообщались? Что смущало — цена, сроки, или непонятность?"
-Клиент назовет боли (например: боязь, что цена вырастет, или недоверие). ЗАПОМНИ ИХ.
-
-ЭТАП 3: ПРЕЗЕНТАЦИЯ-ЗЕРКАЛО
-Используй ТОЛЬКО те слова и боли, которые назвал клиент. 
-Пример: "Смотрите, вы сказали, что для вас важно, чтобы итоговая сумма не выросла. Как раз под это мы фиксируем смету до начала работ."
-После презентации узнай имя клиента, адрес доставки и рассчитай ИТОГОВУЮ стоимость (Цена за кв.м * Площадь). Назови сумму.
-
-ЭТАП 4: ОТРАБОТКА ВОЗРАЖЕНИЙ (Филигранно)
-Формула: Согласие → Уточняющий вопрос → Точечный контраргумент → Маленький шаг.
-- Если "Дорого": "Да, сумма ощутимая. Дорого по сравнению с другим предложением, или просто бюджет тянет?" (Если сравнивает: "Окей, часто разница из-за того, что туда не включена гидроизоляция. Давайте я подготовлю смету с разбивкой, чтобы честно сравнить?").
-- Если "Подумаю": "Конечно, дело серьезное. Думать будете над суммой, сроками, или хочется сравнить?" 
-Не дави. Предлагай маленькие шаги (скинуть смету, разбить на этапы).
-
-ЭТАП 5: ЗАВЕРШЕНИЕ
-- Если клиент СОГЛАСЕН на маленький шаг или подтвердил заказ → вызови функцию `create_order`, передав ИТОГОВУЮ ЦЕНУ, имя, адрес, материал, цвет и площадь.
-- Если клиент ОКОНЧАТЕЛЬНО отказался после 2-3 твоих попыток отработать возражение → вежливо попрощайся ("Оставлю смету у вас, если что — обращайтесь") → вызови функцию `end_chat`.
-
-Данные, которые обязательно нужно собрать для функции create_order: Имя, Материал, Цвет, Площадь, Итоговая стоимость, Адрес доставки.
-"""
-
-# Функция 1: Создание заказа (добавлена цена)
-create_order_function = {
-    "name": "create_order",
-    "description": "Вызови эту функцию, когда клиент согласился и подтвердил заказ. Обязательно посчитай итоговую цену.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "name": {"type": "string", "description": "Имя клиента"},
-            "material": {
-                "type": "string",
-                "description": "Тип материала (металлочерепица, профнастил и т.д.)",
-            },
-            "color": {"type": "string", "description": "Цвет материала"},
-            "area": {
-                "type": "string",
-                "description": "Площадь в квадратных метрах",
-            },
-            "price": {
-                "type": "string",
-                "description": "Итоговая расчетная стоимость заказа в тенге (только цифры)",
-            },
-            "address": {
-                "type": "string",
-                "description": "Адрес доставки или 'Самовывоз'",
-            },
-        },
-        "required": ["name", "material", "color", "area", "price"],
-    },
-}
-
-# Функция 2: Завершение чата (если клиент ушел)
-end_chat_function = {
-    "name": "end_chat",
-    "description": "Вызови эту функцию, если клиент окончательно отказался от покупки и разговор завершен",
-    "parameters": {
-        "type": "object",
-        "properties": {},
-    },
-}
-
-# Инициализация модели
-model = genai.GenerativeModel(
-    model_name="models/gemini-3.1-flash-lite",
-    system_instruction=SYSTEM_PROMPT,
-    tools=[{"function_declarations": [create_order_function, end_chat_function]}],
-)
+def send_whatsapp_message(phone_number: str, text: str) -> None:
+    url = f"https://graph.facebook.com/v18.0/{WA_PHONE_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WA_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone_number,
+        "type": "text",
+        "text": {"body": text},
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        if resp.status_code >= 400:
+            print(f"[WA ERROR] {resp.status_code} {resp.text}")
+    except requests.RequestException as e:
+        print(f"[WA EXCEPTION] {e}")
 
 
-class RateLimiter:
-    """
-    Потокобезопасный sliding-window лимитер запросов. Лимит подписки Gemini API
-    (15 запросов/мин) действует на весь ключ/проект целиком, а не на клиента —
-    поэтому лимитер один общий на все потоки, а не per-phone.
+# --- ЛОГИКА GEMINI (SYSTEM PROMPT & TOOLS) ---
+# Текст SPIN-промпта — в rag/prompts.py: тот же промпт используют evals и CLI.
 
-    acquire() блокирует вызывающий поток до тех пор, пока не появится свободный
-    слот. Так как Gemini-запросы и так выполняются в отдельных потоках (через
-    asyncio.to_thread), это ожидание не блокирует event loop FastAPI — другие
-    клиенты продолжают обслуживаться, просто их Gemini-запросы тоже встанут
-    в общую очередь лимитера.
-    """
+SYSTEM_PROMPT = build_bot_system_prompt(prices_text)
 
-    def __init__(self, max_calls: int, period_seconds: float):
-        self.max_calls = max_calls
-        self.period = period_seconds
-        self.calls: deque[float] = deque()
-        self.lock = threading.Lock()
-
-    def acquire(self):
-        while True:
-            with self.lock:
-                now = time.time()
-                while self.calls and now - self.calls[0] > self.period:
-                    self.calls.popleft()
-
-                if len(self.calls) < self.max_calls:
-                    self.calls.append(now)
-                    return
-
-                wait_time = self.period - (now - self.calls[0]) + 0.05
-            time.sleep(max(wait_time, 0.05))
-
-
-# Лимит тарифа Gemini API — 15 запросов/мин на весь ключ/проект; держим запас
-# 14 вместо 15 на случай погрешности таймингов. Переопределяется в .env (GEMINI_RPM).
-GEMINI_RPM = int(os.getenv("GEMINI_RPM", "14"))
-gemini_rate_limiter = RateLimiter(max_calls=GEMINI_RPM, period_seconds=60)
+# Инициализация модели: инструменты агента (lookup_pricing, create_lead) и
+# кэш моделей по системному промпту — в rag/agent.py.
+model = get_model(SYSTEM_PROMPT)
 
 
 def serialize_chat_history(chat) -> list[dict]:
@@ -507,7 +360,7 @@ def serialize_chat_history(chat) -> list[dict]:
     (например, отправленное клиентом аудио) не сериализуются дословно — для
     аудио подставляется текстовая заглушка. Это осознанный компромисс: такие
     части встречаются либо в середине диалога (аудио, не критично для контекста
-    следующих реплик), либо прямо перед закрытием сессии (create_order/end_chat),
+    следующих реплик), либо прямо перед закрытием сессии (create_lead),
     когда сессия и так удаляется.
     """
     serialized = []
@@ -517,7 +370,7 @@ def serialize_chat_history(chat) -> list[dict]:
             text_parts = []
             for part in content.parts:
                 text = getattr(part, "text", None)
-                if text:
+                if isinstance(text, str) and text:
                     text_parts.append(text)
                 elif getattr(part, "inline_data", None) is not None:
                     text_parts.append("[голосовое сообщение]")
@@ -566,117 +419,47 @@ def process_gemini_response(phone_number, user_message=None, audio_data=None, mi
             # в обоих случаях build_chat_session корректно восстановит/создаст сессию
             chat = build_chat_session(phone_number)
 
-    if user_message:
-        log_chat_to_file(phone_number, "Клиент", user_message)
-        user_message = build_message_with_kb(user_message, phone_number)
-        try:
-            gemini_rate_limiter.acquire()
-            response = chat.send_message(user_message)
-        except Exception as e:
-            print(f"[GEMINI ERROR] {phone_number}: {e}")
-            send_whatsapp_message(
-                phone_number,
-                "Небольшая техническая заминка, попробуйте, пожалуйста, отправить сообщение ещё раз.",
+    # --- АГЕНТ-ЦИКЛ (rag.agent): первый ход с контекстом базы знаний,
+    # дальше инструменты lookup_pricing/create_lead до финального текста ---
+    try:
+        if user_message:
+            log_chat_to_file(phone_number, "Клиент", user_message)
+            result = run_agent(
+                chat, phone_number,
+                user_message=user_message, record_lead=_save_lead_to_sheets,
             )
-            return
-    elif audio_data:
-        log_chat_to_file(phone_number, "Клиент", "[Голосовое сообщение]")
-        try:
-            gemini_rate_limiter.acquire()
-            response = chat.send_message([{"mime_type": mime_type, "data": audio_data}])
-        except Exception as e:
-            print(f"[GEMINI ERROR] {phone_number}: {e}")
-            send_whatsapp_message(
-                phone_number,
-                "Небольшая техническая заминка, попробуйте, пожалуйста, отправить сообщение ещё раз.",
+        elif audio_data:
+            log_chat_to_file(phone_number, "Клиент", "[Голосовое сообщение]")
+            result = run_agent(
+                chat, phone_number,
+                audio_data=audio_data, mime_type=mime_type,
+                record_lead=_save_lead_to_sheets,
             )
+        else:
             return
-    else:
+    except Exception as e:
+        print(f"[GEMINI ERROR] {phone_number}: {e}")
+        send_whatsapp_message(
+            phone_number,
+            "Небольшая техническая заминка, попробуйте, пожалуйста, отправить сообщение ещё раз.",
+        )
         return
 
     # Защита от пустого ответа
-    if not getattr(response, "candidates", None):
+    if not result.text:
         send_whatsapp_message(
             phone_number,
             "Ошибка обработки запроса, попробуйте сформулировать вопрос иначе.",
         )
         return
 
-    candidate = response.candidates[0]
-    content = getattr(candidate, "content", None)
-    parts = getattr(content, "parts", []) if content else []
-
-    should_end_session = False
-
-    for part in parts:
-        if hasattr(part, "function_call") and part.function_call.name:
-            func_name = part.function_call.name
-
-            if func_name == "create_order":
-                args = part.function_call.args
-                order_data = {
-                    "name": args.get("name", ""),
-                    "material": args.get("material", ""),
-                    "color": args.get("color", ""),
-                    "area": args.get("area", ""),
-                    "price": args.get("price", "0"),
-                    "address": args.get("address", "Самовывоз"),
-                    "phone": phone_number,
-                }
-                send_whatsapp_to_owner(order_data)
-                add_to_google_sheets(order_data)
-
-                try:
-                    gemini_rate_limiter.acquire()
-                    response = chat.send_message(
-                        genai.protos.Content(
-                            parts=[
-                                genai.protos.Part(
-                                    function_response=genai.protos.FunctionResponse(
-                                        name="create_order",
-                                        response={"result": "success"},
-                                    )
-                                )
-                            ]
-                        )
-                    )
-                except Exception as e:
-                    print(f"[GEMINI ERROR] {phone_number}: {e}")
-                should_end_session = True
-                break
-
-            elif func_name == "end_chat":
-                try:
-                    gemini_rate_limiter.acquire()
-                    response = chat.send_message(
-                        genai.protos.Content(
-                            parts=[
-                                genai.protos.Part(
-                                    function_response=genai.protos.FunctionResponse(
-                                        name="end_chat",
-                                        response={"result": "success"},
-                                    )
-                                )
-                            ]
-                        )
-                    )
-                except Exception as e:
-                    print(f"[GEMINI ERROR] {phone_number}: {e}")
-                should_end_session = True
-                break
-
-    reply_text = getattr(response, "text", None)
-    if not reply_text:
-        reply_text = (
-            "Не удалось сформировать ответ, давайте попробуем переформулировать вопрос."
-        )
-
+    reply_text = result.text
     log_chat_to_file(phone_number, "ИИ-Бот", reply_text)
     send_whatsapp_message(phone_number, reply_text)
 
-    # --- УДАЛЯЕМ ЛИДА ПРИ ЗАВЕРШЕНИИ ИЛИ СОХРАНЯЕМ ИСТОРИЮ ---
+    # --- ЛИД СОХРАНЁН → ЗАКРЫВАЕМ СЕССИЮ; ИНАЧЕ СОХРАНЯЕМ ИСТОРИЮ ---
     with state_lock:
-        if should_end_session:
+        if result.lead_saved:
             chat_sessions.pop(phone_number, None)
             open_leads.pop(phone_number, None)
             save_leads(open_leads)
@@ -711,7 +494,7 @@ def verify_webhook_signature(raw_body: bytes, signature_header: str | None) -> b
     """
     Проверяет подпись X-Hub-Signature-256, которую Meta добавляет к каждому
     вебхуку. Без этой проверки любой человек, узнавший URL вебхука, может
-    слать поддельные "сообщения от клиента" и триггерить create_order/оповещения.
+    слать поддельные "сообщения от клиента" и триггерить создание лидов.
     """
     if not WA_APP_SECRET:
         # Секрет не настроен — не можем проверить подпись. Не блокируем работу бота

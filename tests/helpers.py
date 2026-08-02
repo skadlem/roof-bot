@@ -16,7 +16,7 @@ def make_response(text="Привет!"):
 
 
 def make_function_response(name, args):
-    """Фейковый ответ модели с function_call (create_order / end_chat)."""
+    """Фейковый ответ модели с function_call (lookup_pricing / create_lead)."""
     fc = types.SimpleNamespace(name=name, args=args)
     part = types.SimpleNamespace(text=None, function_call=fc, inline_data=None)
     content = types.SimpleNamespace(parts=[part])

@@ -5,6 +5,7 @@ import os
 import pytest
 import google.generativeai as genai
 
+import rag.agent
 from tests.helpers import FakeChat, FakeModel
 
 
@@ -98,6 +99,8 @@ def clean_state(main):
         main.seen_messages.clear()
     main._sheet = None
     main.gemini_rate_limiter = _NoLimit()
+    # агент-цикл лимитирует обращения через свой модульный инстанс (main его импортирует)
+    rag.agent.gemini_rate_limiter = _NoLimit()
     main.scheduler = _DummyScheduler()
     yield
 

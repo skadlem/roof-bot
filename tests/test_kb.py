@@ -69,22 +69,28 @@ def fake_rag(main, monkeypatch):
     monkeypatch.setattr(rag_retrieve, "retrieve", fake_retrieve)
 
 
-def test_build_message_with_kb_formats_context(main, fake_rag):
-    result = main.build_message_with_kb("какая гарантия?", "79990000000")
-    assert "гарантия: 5 лет" in result
-    assert "[kb/faq.md]" in result
-    assert result.endswith("какая гарантия?")
+def test_first_turn_sends_kb_context(main, fake_rag, gemini, outbox):
+    """Агент-цикл (rag.agent.run_agent) подмешивает контекст в первый ход."""
+    main.process_gemini_response("79990000000", user_message="какая гарантия?")
+    sent = gemini.sent_messages[0][0][0]
+    assert "гарантия: 5 лет" in sent
+    assert "[kb/faq.md]" in sent
+    assert sent.endswith("какая гарантия?")
 
 
-def test_build_message_with_kb_below_threshold_returns_original(main, fake_rag):
-    assert main.build_message_with_kb("здравствуйте", "79990000000") == "здравствуйте"
+def test_first_turn_below_threshold_sends_plain_question(main, fake_rag, gemini, outbox):
+    main.process_gemini_response("79990000000", user_message="здравствуйте")
+    assert gemini.sent_messages[0][0][0] == "здравствуйте"
 
 
-def test_build_message_with_kb_retrieve_exception_returns_original(main, monkeypatch):
+def test_first_turn_retrieve_exception_falls_back_to_plain_question(
+    main, gemini, outbox, monkeypatch
+):
     def boom(question, client_id, k=4):
         raise RuntimeError("no api")
     monkeypatch.setattr(rag_retrieve, "retrieve", boom)
-    assert main.build_message_with_kb("гарантия", "79990000000") == "гарантия"
+    main.process_gemini_response("79990000000", user_message="гарантия")
+    assert gemini.sent_messages[0][0][0] == "гарантия"
 
 
 def test_system_prompt_defers_to_manager(main):

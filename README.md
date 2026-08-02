@@ -2,16 +2,16 @@
 
 [![CI](https://github.com/skadlem/roof-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/skadlem/roof-bot/actions/workflows/ci.yml)
 
-**A WhatsApp sales manager for a roofing company.** It picks up every incoming message in Russian, runs a full SPIN sales conversation, prices the job live from your price list, and hands every confirmed order to you in Google Sheets and on your own WhatsApp.
+**A WhatsApp sales manager for a roofing company.** It picks up every incoming message in Russian, runs a full SPIN sales conversation as a Gemini agent (tool-calling), prices the job live from your price list, and hands every confirmed lead to you in Google Sheets and on your own WhatsApp.
 
 ## What it does
 
 - **Sells by itself** — Gemini AI drives the conversation with a real sales script (diagnosis → pain discovery → mirror presentation → objection handling → close), tuned for roofing: object type, build stage, roof area and geometry, deadlines.
-- **Prices on the spot** — loads your price list (`prices.json`, ₸/m²) and calculates the customer's total mid-conversation (price × area), named and quoted before the close.
+- **Prices on the spot** — an agent tool (`lookup_pricing`) reads your price list (`prices.json`, ₸/m²) and answers exact prices mid-conversation; the total (price × area) is named and quoted before the close.
 - **Understands voice messages** — customers can send audio; the bot downloads it from WhatsApp and transcribes it.
 - **Writes like a human** — short messenger-style replies, one question per message, no lists, no emoji spam, no fake urgency. Follows up on objections without pressure.
-- **Captures the full order** — name, material, color, area, final price, delivery address — and finalizes it in one message.
-- **Delivers every lead to you** — each order is duplicated to the owner's WhatsApp and appended to a Google Sheet for your CRM / bookkeeping.
+- **Captures the full order** — name, material, color, area, final price, delivery address — and finalizes it in one message with the `create_lead` tool.
+- **Delivers every lead to you** — each lead is appended to a Google Sheet for your CRM / bookkeeping and duplicated to the owner's WhatsApp.
 - **Follows up cold leads** — APScheduler sends one polite reminder after 4 hours of silence, then leaves the customer alone.
 - **Safe by default** — verifies the Meta webhook signature on every request, deduplicates webhook deliveries, rate-limits per customer, and logs every conversation to a per-phone-number file.
 
@@ -21,13 +21,13 @@
 2. The bot introduces itself once — "Вы обратились в компанию МеталлКровля, я виртуальный менеджер по кровле" — and starts diagnosing: what's the object, what stage is the build, what area and shape, what's the deadline.
 3. It finds what already annoyed the customer with other contractors (price, terms, trust) and mirrors their own words back in the offer.
 4. Objections like "дорого" or "подумаю" get handled with a formula — agree → clarify → counter → small step — never pressure.
-5. On confirmation it calculates the total and creates the order.
-6. The order lands in Google Sheets and on the owner's phone; the customer gets a clean goodbye.
+5. On confirmation it calculates the total and saves the lead (`create_lead` tool) — the tool validates the name and phone and appends the row to the sheet.
+6. The lead lands in Google Sheets and on the owner's phone (template `new_order_notification`); the customer gets a clean goodbye.
 
 ## How it's built
 
 ```
-Customer ──▶ WhatsApp Cloud API ──▶ FastAPI webhook ──▶ Gemini (text + voice)
+Customer ──▶ WhatsApp Cloud API ──▶ FastAPI webhook ──▶ Gemini agent (text + voice)
     ▲                                   │
     └──────────── reply via API ◄───────┘
                                         │
@@ -40,7 +40,7 @@ Customer ──▶ WhatsApp Cloud API ──▶ FastAPI webhook ──▶ Gemini
 
 - **FastAPI** — webhook endpoint, signature verification, message dedup
 - **WhatsApp Cloud API (Meta)** — send/receive messages, download voice audio
-- **Gemini API** — the sales brain, driven by a full system-prompt sales script
+- **Gemini API** — the sales brain: an agent loop (up to 3 turns per message) with two tools, driven by a full system-prompt sales script
 - **Google Sheets (gspread)** — lead export
 - **APScheduler** — 4-hour follow-up for unanswered leads
 
@@ -58,7 +58,7 @@ pip install -r requirements.txt
    - `GEMINI_API_KEY` — Google Gemini key
    - `SHEET_KEY` — ID of the Google Sheet used for order export and RAG ingestion
    - `WA_TOKEN`, `WA_PHONE_ID`, `WA_VERIFY_TOKEN`, `WA_APP_SECRET` — WhatsApp Cloud API settings
-   - `OWNER_PHONE_NUMBER` — owner's phone number, leads are duplicated to it
+   - `OWNER_PHONE_NUMBER` — owner's phone number, new leads are duplicated to it
 2. Place `google_credentials.json` (Google Sheets service account) in the repo root.
 3. Put your prices in `prices.json` (₸ per m²) — the bot quotes them in conversation.
 
@@ -72,11 +72,12 @@ Two pipelines feed the bot. Write real facts in `kb/*.md` — one topic per file
 venv\Scripts\python.exe -m rag.ingest
 ```
 
-Idempotent: re-running only re-embeds changed sources (per-source sha256). Sheet rows get `client_id = phone`; kb facts are shared across all clients. This is the pipeline the bot uses at runtime: every text message retrieves the closest chunks for the client's phone and sends them to Gemini as context (only chunks above the similarity threshold — `RAG_SIMILARITY_THRESHOLD` in `rag/prompts.py`). Try it manually:
+Idempotent: re-running only re-embeds changed sources (per-source sha256). Sheet rows get `client_id = phone`; kb facts are shared across all clients. This is the pipeline the bot uses at runtime: every text message retrieves the closest chunks for the client's phone and wraps the first agent turn with them as context (only chunks above the similarity threshold — `RAG_SIMILARITY_THRESHOLD` in `rag/prompts.py`). Try the pieces manually:
 
 ```bash
 venv\Scripts\python.exe -m rag.retrieve "how much does metal tile cost" <client_id>
-venv\Scripts\python.exe -m rag.ask "how much does metal tile cost" <client_id>   # bot flow: context → Gemini answer + sources
+venv\Scripts\python.exe -m rag.ask "how much does metal tile cost" <client_id>      # step-2 flow: context → Gemini answer + sources (no tools)
+venv\Scripts\python.exe -m rag.agent_cli <client_id>                                # agent loop: multi-turn REPL, prints every tool call
 ```
 
 Needs `GEMINI_API_KEY` and `SHEET_KEY` in `.env`, plus `google_credentials.json`.
@@ -84,6 +85,15 @@ Needs `GEMINI_API_KEY` and `SHEET_KEY` in `.env`, plus `google_credentials.json`
 **`build_kb.py` (legacy, no longer loaded)** — the previous retrieval path (`kb_embeddings.json`, `gemini-embedding-001`). The bot stopped loading it when `rag/` was wired in; keep the file only for reference.
 
 If the knowledge base is missing or no chunk is above the threshold, retrieval is disabled: the bot never invents prices, services, timelines, delivery zones, or guarantees — it says it will check with a manager. Voice messages never trigger retrieval.
+
+## Agent loop (tools)
+
+Every message runs through a small agent loop (`rag/agent.py`): the first Gemini turn is grounded in the retrieved KB context (or raw audio parts for voice), and every `function_call` the model makes is executed and fed back — up to `MAX_TURNS` (3) calls to Gemini before the final text goes to the customer. The whole sequence runs under a per-phone lock, so one customer's turns never interleave; a shared sliding-window rate limiter (`GEMINI_RPM`, default 14) paces all calls against the API quota.
+
+Two tools:
+
+- `lookup_pricing(service)` — exact price per m² from `prices.json`, the same live file embedded in the system prompt (the copy in `kb/faq.md` is stale). The model is told to quote prices only through this tool.
+- `create_lead(name, phone, service, message)` — appends the lead row to the Google Sheet. It validates: name non-empty, phone 7–15 digits (falls back to the customer's own number if the model didn't pass one). A validation error goes back to the model to relay — a bad lead never reaches the sheet and the conversation stays open. A saved lead closes the session.
 
 ## Run
 

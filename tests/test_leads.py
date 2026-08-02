@@ -125,15 +125,13 @@ def test_very_old_lead_removed(main, outbox, gemini):
     assert outbox == []
 
 
-# --- create_order: заказ, уведомление владельца, экспорт в таблицу ---
+# --- create_lead: лид в таблицу, закрытие сессии (уведомления владельца больше нет) ---
 
-ORDER_ARGS = {
+LEAD_ARGS = {
     "name": "Иван",
-    "material": "Металлочерепица",
-    "color": "Коричневый",
-    "area": "100",
-    "price": "350000",
-    "address": "Алматы, ул. Тестовая 1",
+    "phone": "77001234567",
+    "service": "Металлочерепица",
+    "message": "Кровля 100 м², хочу смету",
 }
 
 
@@ -147,22 +145,28 @@ def _active_lead(main, gemini, phone="77001234567"):
         main.chat_sessions[phone] = gemini
 
 
-def test_create_order_flow(main, outbox, sheets, gemini):
+def _lead_result(gemini):
+    """Результат create_lead, который агент-цикл вернул модели."""
+    content = gemini.sent_messages[1][0][0]
+    return content.parts[0].function_response.response["result"]
+
+
+def test_create_lead_flow(main, outbox, sheets, gemini):
     phone = "77001234567"
     _active_lead(main, gemini, phone)
-    gemini.responses.append(make_function_response("create_order", dict(ORDER_ARGS)))
+    gemini.responses.append(make_function_response("create_lead", dict(LEAD_ARGS)))
 
-    main.process_gemini_response(phone, user_message="Согласен, заказываю")
+    main.process_gemini_response(phone, user_message="Согласен, оставьте заявку")
 
-    # владельцу ушёл шаблон new_order_notification
-    templates = [x for x in outbox if x[0] == "template"]
-    assert len(templates) == 1
-    assert templates[0][2] == "new_order_notification"
-
-    # заказ ушёл в таблицу с именем и телефоном клиента
-    assert sheets.rows, "строка заказа должна попасть в таблицу"
+    # лид ушёл в таблицу, владельцу — шаблон new_order_notification
+    assert sheets.rows, "строка лида должна попасть в таблицу"
     assert sheets.rows[0][0] == "Иван"
     assert sheets.rows[0][1] == phone
+    assert sheets.rows[0][2] == "Металлочерепица"
+    templates = [x for x in outbox if x[0] == "template"]
+    assert len(templates) == 1
+    assert templates[0][1] == "79990000000"
+    assert templates[0][2] == "new_order_notification"
 
     # клиенту ушёл финальный ответ
     assert any(x[0] == "text" and x[1] == phone for x in outbox)
@@ -172,17 +176,36 @@ def test_create_order_flow(main, outbox, sheets, gemini):
     assert phone not in main.chat_sessions
 
 
-def test_create_order_handles_missing_fields(main, outbox, sheets, gemini):
-    """Модель может не заполнить все поля — код не должен упасть."""
+def test_create_lead_rejects_bad_phone(main, outbox, sheets, gemini):
+    """Телефон не похож на номер — лид не пишется, ошибка уходит модели."""
     phone = "77001234567"
     _active_lead(main, gemini, phone)
-    gemini.responses.append(make_function_response("create_order", {"name": "Иван"}))
+    args = dict(LEAD_ARGS, phone="abc")
+    gemini.responses.append(make_function_response("create_lead", args))
+
+    main.process_gemini_response(phone, user_message="Запишите меня")
+
+    assert sheets.rows == [], "с невалидным телефоном лид в таблицу не пишется"
+    assert _lead_result(gemini).startswith("Ошибка:")
+    assert any(x[0] == "text" and x[1] == phone for x in outbox)
+    assert not any(x[0] == "template" for x in outbox), "с ошибкой валидации владельцу не шлём"
+    # ошибка валидации сессию не закрывает — клиент остаётся в диалоге
+    assert phone in main.open_leads
+    assert phone in main.chat_sessions
+
+
+def test_create_lead_missing_phone_falls_back_to_client(main, outbox, sheets, gemini):
+    """Модель не передала телефон — подставляется номер клиента из сообщения."""
+    phone = "77001234567"
+    _active_lead(main, gemini, phone)
+    gemini.responses.append(make_function_response(
+        "create_lead", {"name": "Иван", "service": "Фальц", "message": "Хочу смету"}
+    ))
 
     main.process_gemini_response(phone, user_message="Заказываю")
 
-    assert sheets.rows
-    assert sheets.rows[0][0] == "Иван"
-    assert sheets.rows[0][6] == "Самовывоз", "незаполненный адрес подставляется по умолчанию"
+    assert sheets.rows[0][1] == phone, "телефон должен подставиться из client_id"
+    assert phone not in main.open_leads
 
 
 def test_sheets_failure_tolerated(main, outbox, gemini, monkeypatch):
@@ -194,23 +217,11 @@ def test_sheets_failure_tolerated(main, outbox, gemini, monkeypatch):
 
     phone = "77001234567"
     _active_lead(main, gemini, phone)
-    gemini.responses.append(make_function_response("create_order", dict(ORDER_ARGS)))
+    gemini.responses.append(make_function_response("create_lead", dict(LEAD_ARGS)))
 
     main.process_gemini_response(phone, user_message="Заказываю")
 
-    # владелец уведомлён, клиенту ответ ушёл, лид закрыт — как в штатном сценарии
-    assert any(x[0] == "template" for x in outbox)
+    # клиенту ответ ушёл, владелец уведомлён, лид закрыт — как в штатном сценарии
     assert any(x[0] == "text" and x[1] == phone for x in outbox)
+    assert any(x[0] == "template" for x in outbox)
     assert phone not in main.open_leads
-
-
-def test_end_chat_closes_lead_without_order(main, outbox, gemini):
-    phone = "77001234567"
-    _active_lead(main, gemini, phone)
-    gemini.responses.append(make_function_response("end_chat", {}))
-
-    main.process_gemini_response(phone, user_message="Спасибо, не нужно")
-
-    assert phone not in main.open_leads
-    assert phone not in main.chat_sessions
-    assert not any(x[0] == "template" for x in outbox), "при отказе заказ владельцу не шлётся"
