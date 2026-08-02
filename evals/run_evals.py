@@ -60,7 +60,10 @@ def load_golden_set():
 
 def run_case(case):
     """Агент-цикл на один кейс: без WhatsApp, без записи в таблицу."""
-    chat = agent.get_model(system_prompt=BOT_SYSTEM_PROMPT).start_chat(history=[])
+    chat = agent.ChatSession(
+        agent.get_model(system_prompt=BOT_SYSTEM_PROMPT),
+        system_prompt=BOT_SYSTEM_PROMPT,
+    )
     result = agent.run_agent(
         chat, case["client_id"],
         user_message=case["question"],

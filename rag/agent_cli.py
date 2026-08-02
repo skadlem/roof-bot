@@ -11,7 +11,7 @@ import sys
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-from rag.agent import DEFAULT_SYSTEM_PROMPT, get_model, run_agent
+from rag.agent import ChatSession, DEFAULT_SYSTEM_PROMPT, get_model, run_agent
 from rag.prompts import RAG_SIMILARITY_THRESHOLD
 
 # консоль Windows (cp1252) не умеет кириллицу в print; stdin тоже перекодируем,
@@ -58,7 +58,8 @@ def main():
         )
     genai.configure(api_key=api_key)
 
-    chat = get_model(DEFAULT_SYSTEM_PROMPT).start_chat(history=[])
+    chat = ChatSession(get_model(DEFAULT_SYSTEM_PROMPT),
+                       system_prompt=DEFAULT_SYSTEM_PROMPT)
     print(f"Агент готов (client_id={client_id}). Пустая строка или 'exit' — выход.")
     while True:
         try:

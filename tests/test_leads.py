@@ -1,8 +1,12 @@
 """Логика лидов: создание, обновление, follow-up, экспорт заказа в таблицу."""
 
+import json
 import time
 
-from tests.helpers import make_function_response
+from langchain_core.messages import HumanMessage, ToolMessage
+
+from rag.agent import ChatSession
+from tests.helpers import make_tool_call_response
 
 
 def test_new_phone_creates_lead(main, outbox, gemini):
@@ -48,13 +52,15 @@ def test_history_restored_from_disk(main, outbox, monkeypatch):
 
     def spy_build(p):
         chat = real_build(p)
-        started_with[p] = list(chat.history)
+        started_with[p] = list(chat.messages)
         return chat
 
     monkeypatch.setattr(main, "build_chat_session", spy_build)
     main.process_gemini_response(phone, user_message="Привет")
 
-    assert started_with[phone] == saved, "сессия должна строиться на истории с диска"
+    assert started_with[phone] == [HumanMessage(content="Здравствуйте")], (
+        "сессия должна строиться на истории с диска"
+    )
 
 
 # --- Follow-up ---
@@ -71,7 +77,7 @@ def test_followup_sent_for_stale_lead(main, outbox, gemini):
             "followup_sent": False,
             "history": [],
         }
-        main.chat_sessions[phone] = gemini
+        main.chat_sessions[phone] = ChatSession(gemini, system_prompt="тест")
 
     main.check_stale_leads()
 
@@ -116,7 +122,7 @@ def test_very_old_lead_removed(main, outbox, gemini):
             "followup_sent": False,
             "history": [],
         }
-        main.chat_sessions[phone] = gemini
+        main.chat_sessions[phone] = ChatSession(gemini, system_prompt="тест")
 
     main.check_stale_leads()
 
@@ -142,19 +148,22 @@ def _active_lead(main, gemini, phone="77001234567"):
             "followup_sent": False,
             "history": [],
         }
-        main.chat_sessions[phone] = gemini
+        main.chat_sessions[phone] = ChatSession(gemini, system_prompt="тест")
 
 
 def _lead_result(gemini):
     """Результат create_lead, который агент-цикл вернул модели."""
-    content = gemini.sent_messages[1][0][0]
-    return content.parts[0].function_response.response["result"]
+    for msgs in reversed(gemini.invoked):
+        for m in reversed(msgs):
+            if isinstance(m, ToolMessage):
+                return json.loads(m.content)["result"]
+    raise AssertionError("ToolMessage не найден в invoked")
 
 
 def test_create_lead_flow(main, outbox, sheets, gemini):
     phone = "77001234567"
     _active_lead(main, gemini, phone)
-    gemini.responses.append(make_function_response("create_lead", dict(LEAD_ARGS)))
+    gemini.responses.append(make_tool_call_response("create_lead", dict(LEAD_ARGS)))
 
     main.process_gemini_response(phone, user_message="Согласен, оставьте заявку")
 
@@ -181,7 +190,7 @@ def test_create_lead_rejects_bad_phone(main, outbox, sheets, gemini):
     phone = "77001234567"
     _active_lead(main, gemini, phone)
     args = dict(LEAD_ARGS, phone="abc")
-    gemini.responses.append(make_function_response("create_lead", args))
+    gemini.responses.append(make_tool_call_response("create_lead", args))
 
     main.process_gemini_response(phone, user_message="Запишите меня")
 
@@ -198,7 +207,7 @@ def test_create_lead_missing_phone_falls_back_to_client(main, outbox, sheets, ge
     """Модель не передала телефон — подставляется номер клиента из сообщения."""
     phone = "77001234567"
     _active_lead(main, gemini, phone)
-    gemini.responses.append(make_function_response(
+    gemini.responses.append(make_tool_call_response(
         "create_lead", {"name": "Иван", "service": "Фальц", "message": "Хочу смету"}
     ))
 
@@ -218,7 +227,7 @@ def test_sheets_failure_tolerated(main, outbox, gemini, monkeypatch):
 
     phone = "77001234567"
     _active_lead(main, gemini, phone)
-    gemini.responses.append(make_function_response("create_lead", dict(LEAD_ARGS)))
+    gemini.responses.append(make_tool_call_response("create_lead", dict(LEAD_ARGS)))
 
     main.process_gemini_response(phone, user_message="Заказываю")
 

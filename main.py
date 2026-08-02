@@ -15,7 +15,9 @@ from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from rag.agent import gemini_rate_limiter, get_model, load_prices, run_agent
+from rag.agent import (
+    ChatSession, gemini_rate_limiter, get_model, load_prices, message_text, run_agent,
+)
 from rag.prompts import build_bot_system_prompt
 
 LEADS_FILE = "open_leads.json"
@@ -401,17 +403,21 @@ def serialize_chat_history(chat) -> list[dict]:
     """
     serialized = []
     try:
-        for content in chat.history:
-            role = content.role
-            text_parts = []
-            for part in content.parts:
-                text = getattr(part, "text", None)
-                if isinstance(text, str) and text:
-                    text_parts.append(text)
-                elif getattr(part, "inline_data", None) is not None:
-                    text_parts.append("[голосовое сообщение]")
-            if text_parts:
-                serialized.append({"role": role, "parts": text_parts})
+        for message in chat.messages:
+            if message.type == "tool":
+                continue  # function_call/function_response дословно не сериализуются
+            text = message_text(message)
+            parts = []
+            content = getattr(message, "content", "")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "audio":
+                        parts.append("[голосовое сообщение]")
+            if text:
+                parts.append(text)
+            if parts:
+                role = "user" if message.type == "human" else "model"
+                serialized.append({"role": role, "parts": parts})
     except Exception as e:
         print(f"[HISTORY SERIALIZE ERROR] {e}")
     return serialized
@@ -425,10 +431,10 @@ def build_chat_session(phone_number: str):
     """
     saved_history = open_leads.get(phone_number, {}).get("history", [])
     try:
-        chat = model.start_chat(history=saved_history)
+        chat = ChatSession(model, system_prompt=SYSTEM_PROMPT, history=saved_history)
     except Exception as e:
         print(f"[HISTORY REBUILD ERROR] {phone_number}: {e}")
-        chat = model.start_chat()
+        chat = ChatSession(model, system_prompt=SYSTEM_PROMPT)
     chat_sessions[phone_number] = chat
     return chat
 
@@ -692,9 +698,7 @@ def check_stale_leads():
                 try:
                     gemini_rate_limiter.acquire()
                     response = chat.send_message(prompt)
-                    # у response.text дефолт "" уже есть — getattr с фолбэком не
-                    # сработал бы; явно проверяем пустоту
-                    reply_text = (getattr(response, "text", "") or "").strip()
+                    reply_text = message_text(response).strip()
                     if not reply_text:
                         reply_text = "Если что, я здесь и могу помочь по вашему объекту."
 

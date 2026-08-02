@@ -7,7 +7,7 @@ import google.generativeai as genai
 
 import rag.agent
 import rag.retrieve
-from tests.helpers import FakeChat, FakeModel
+from tests.helpers import FakeLLM
 
 
 class _NoLimit:
@@ -70,7 +70,7 @@ def sandbox(tmp_path_factory):
     })
 
     real_model_cls = genai.GenerativeModel
-    genai.GenerativeModel = lambda *a, **k: FakeModel()
+    genai.GenerativeModel = lambda *a, **k: None
     try:
         import main
         yield main
@@ -136,9 +136,9 @@ def outbox(main, monkeypatch):
 
 @pytest.fixture
 def gemini(main, monkeypatch):
-    """Фейковая Gemini-модель с одним FakeChat; тесты задают scripted-ответы."""
-    chat = FakeChat()
-    monkeypatch.setattr(main, "model", FakeModel(chat=chat))
+    """Фейковая LLM-модель; тесты задают scripted-ответы."""
+    chat = FakeLLM()
+    monkeypatch.setattr(main, "model", chat)
     return chat
 
 

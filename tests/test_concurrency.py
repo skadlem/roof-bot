@@ -2,12 +2,12 @@
 
 import threading
 
-from tests.helpers import FakeModel, Tracker, TrackingChat, make_text_message
+from tests.helpers import TrackingFakeLLM, Tracker, make_text_message
 
 
 def _run_in_threads(main, monkeypatch, phones):
     tracker = Tracker()
-    monkeypatch.setattr(main, "model", FakeModel(chat=TrackingChat(tracker)))
+    monkeypatch.setattr(main, "model", TrackingFakeLLM(tracker))
     errors = []
 
     def work(phone):

@@ -72,7 +72,7 @@ def fake_rag(main, monkeypatch):
 def test_first_turn_sends_kb_context(main, fake_rag, gemini, outbox):
     """Агент-цикл (rag.agent.run_agent) подмешивает контекст в первый ход."""
     main.process_gemini_response("79990000000", user_message="какая гарантия?")
-    sent = gemini.sent_messages[0][0][0]
+    sent = gemini.sent_messages[0]
     assert "гарантия: 5 лет" in sent
     assert "[kb/faq.md]" in sent
     assert sent.endswith("какая гарантия?")
@@ -80,7 +80,7 @@ def test_first_turn_sends_kb_context(main, fake_rag, gemini, outbox):
 
 def test_first_turn_below_threshold_sends_plain_question(main, fake_rag, gemini, outbox):
     main.process_gemini_response("79990000000", user_message="здравствуйте")
-    assert gemini.sent_messages[0][0][0] == "здравствуйте"
+    assert gemini.sent_messages[0] == "здравствуйте"
 
 
 def test_first_turn_retrieve_exception_falls_back_to_plain_question(
@@ -90,7 +90,7 @@ def test_first_turn_retrieve_exception_falls_back_to_plain_question(
         raise RuntimeError("no api")
     monkeypatch.setattr(rag_retrieve, "retrieve", boom)
     main.process_gemini_response("79990000000", user_message="гарантия")
-    assert gemini.sent_messages[0][0][0] == "гарантия"
+    assert gemini.sent_messages[0] == "гарантия"
 
 
 def test_system_prompt_defers_to_manager(main):
@@ -105,13 +105,13 @@ def test_text_message_sends_kb_context(main, fake_rag, gemini, outbox):
     main.handle_single_message(
         make_text_message("79990000000", "какая у вас гарантия на кровлю?")
     )
-    sent = gemini.sent_messages[0][0][0]
+    sent = gemini.sent_messages[0]
     assert "гарантия: 5 лет" in sent
 
 
 def test_text_message_without_match_is_unchanged(main, fake_rag, gemini, outbox):
     main.handle_single_message(make_text_message("79990000000", "здравствуйте"))
-    assert gemini.sent_messages[0][0][0] == "здравствуйте"
+    assert gemini.sent_messages[0] == "здравствуйте"
 
 
 def test_voice_message_skips_kb(main, fake_rag, gemini, outbox, monkeypatch):
@@ -121,5 +121,7 @@ def test_voice_message_skips_kb(main, fake_rag, gemini, outbox, monkeypatch):
     main.process_gemini_response(
         "79990000000", audio_data=b"audio", mime_type="audio/ogg"
     )
-    assert gemini.sent_messages[0][0][0] == [{"mime_type": "audio/ogg", "data": b"audio"}]
+    assert gemini.sent_messages[0] == [
+        {"type": "audio", "base64": "YXVkaW8=", "mime_type": "audio/ogg"}
+    ]
     assert outbox[0][2] == "Привет!"

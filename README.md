@@ -88,7 +88,18 @@ If the knowledge base is missing or no chunk is above the threshold, retrieval i
 
 ## Agent loop (tools)
 
-Every message runs through a small agent loop (`rag/agent.py`): the first Gemini turn is grounded in the retrieved KB context (or raw audio parts for voice), and every `function_call` the model makes is executed and fed back — up to `MAX_TURNS` (3) calls to Gemini before the final text goes to the customer. The whole sequence runs under a per-phone lock, so one customer's turns never interleave; a shared sliding-window rate limiter (`GEMINI_RPM`, default 14) paces all calls against the API quota.
+Every message runs through a LangGraph state machine (`rag/agent.py`). The graph has explicit nodes:
+
+```
+START → retrieve → model ⇄ tools → END
+```
+
+- **retrieve** — grounds the first turn in the retrieved KB context (via `rag/retrieve` + `rag/prompts`, same similarity threshold as before), or passes raw audio parts for voice; voice never triggers retrieval.
+- **model** — one Gemini call (`ChatGoogleGenerativeAI`, tools bound as @tool-decorated functions). Each call takes the rate limiter slot.
+- **tools** — executes every `function_call` the model made and feeds results back as tool messages.
+- A conditional edge routes back to **model** until the model answers with text or the loop hits `MAX_TURNS` (3) calls to Gemini; a trailing `create_lead` in the last turn still executes before the loop ends.
+
+Session state (model + system prompt + history) lives in `ChatSession`; the whole sequence runs under a per-phone lock, so one customer's turns never interleave; a shared sliding-window rate limiter (`GEMINI_RPM`, default 14) paces all calls against the API quota.
 
 Two tools:
 
@@ -112,13 +123,15 @@ $env:GEMINI_RPM = "10"          # PowerShell: keep under the free-tier 15 rpm bu
 venv\Scripts\python.exe -m evals.run_evals
 ```
 
-Prints a pass-rate table (overall and per kb/tools group) and the worst failed cases. Exit code 1 if grounded or correct is below 70%, 2 if cases couldn't be evaluated. The judge sees the same three sources the bot uses: retrieved KB chunks, the price list (from `prices.json`), and tool results. Current:
+Prints a pass-rate table (overall and per kb/tools group) and the worst failed cases. Exit code 1 if grounded or correct is below 70%, 2 if cases couldn't be evaluated. The judge sees the same three sources the bot uses: retrieved KB chunks, the price list (from `prices.json`), and tool results. Last run:
 
 ```
-grounded: 100%  correct: 100%  (из 24 кейсов)
+grounded: 96%  correct: 92%  (из 24 кейсов)
   kb   : grounded 100%  correct 100%  (n=5)
-  tools: grounded 100%  correct 100%  (n=19)
+  tools: grounded 95%  correct 89%  (n=19)
 ```
+
+Scores wobble run to run: four control runs after the LangGraph port gave `correct` 92–100%, `grounded` 96–100%. The only failing cases are order confirmations where the bot quotes the price correctly and saves the lead, but omits the literal phrase «лид сохранён» from the final message (and once added «менеджер свяжется с вами» on top, which the judge flags as ungrounded). The judge is strict about the exact phrase; the same model on the old hand-rolled loop recorded 100/100 in its single pre-port run.
 
 ## Testing
 

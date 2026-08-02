@@ -1,16 +1,18 @@
-"""Агент-цикл Gemini: диалог с инструментами (lookup_pricing, create_lead).
+"""Агент-цикл Gemini на LangGraph: диалог с инструментами (lookup_pricing, create_lead).
 
 Первый ход сообщение клиента оборачивается контекстом RAG-базы (шаг 2:
-rag.retrieve + rag.prompts). Дальше цикл: ответ модели с function_call →
-выполнение инструмента → результат обратно в сессию → следующий вызов —
-пока модель не ответит текстом или не исчерпает MAX_TURNS обращений к Gemini.
+rag.retrieve + rag.prompts). Дальше граф: модель с инструментами → выполнение
+инструментов → результат обратно → следующий ход — пока модель не ответит
+текстом или не исчерпает MAX_TURNS обращений к Gemini.
 
+Граф: retrieve → model ⇄ tools (route по tool_calls и счётчику turns).
 Используется ботом (main.py — модель через get_model(SYSTEM_PROMPT), свой
 промпт SPIN-продаж) и CLI (rag/agent_cli.py — DEFAULT_SYSTEM_PROMPT).
 Бот вызывает run_agent под per-phone lock (main.handle_single_message),
 так что параллельных вызовов на одну сессию нет.
 """
 
+import base64
 import json
 import os
 import re
@@ -18,8 +20,13 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Any, TypedDict
 
-import google.generativeai as genai
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel, Field
 
 from rag import retrieve as rag_retrieve
 from rag.prompts import build_rag_message
@@ -93,79 +100,20 @@ DEFAULT_SYSTEM_PROMPT = """\
 менеджера» и предложи передать вопрос менеджеру."""
 
 
-# Декларации функций в формате легаси google-generativeai (0.8.x): как было
-# с create_order/end_chat в main.py, только нашими двумя инструментами.
-TOOLS = [
-    {
-        "function_declarations": [
-            {
-                "name": "lookup_pricing",
-                "description": (
-                    "Цена услуги за кв.м из прайс-листа компании. Вызывай, "
-                    "когда клиент спрашивает цену или стоимость услуги."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "service": {
-                            "type": "string",
-                            "description": (
-                                "Название услуги/материала (металлочерепица, "
-                                "профнастил, фальц, мягкая кровля и т.п.)"
-                            ),
-                        },
-                    },
-                    "required": ["service"],
-                },
-            },
-            {
-                "name": "create_lead",
-                "description": (
-                    "Сохранить лид клиента: имя, телефон, услуга, сообщение. "
-                    "Вызывай, когда клиент готов оставить заявку или подтвердил заказ. "
-                    "Телефон можно не указывать — подставится номер клиента автоматически."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "Имя клиента"},
-                        "phone": {
-                            "type": "string",
-                            "description": (
-                                "Телефон клиента в международном формате. "
-                                "Можно не указывать — подставится номер клиента автоматически"
-                            ),
-                        },
-                        "service": {
-                            "type": "string",
-                            "description": "Услуга/материал, который интересует клиента",
-                        },
-                        "message": {
-                            "type": "string",
-                            "description": "Краткое описание запроса клиента",
-                        },
-                    },
-                    "required": ["name", "service", "message"],
-                },
-            },
-        ]
-    }
-]
-
-
-# Кэш моделей по системному промпту: у бота свой (SPIN-продажи), у CLI —
-# DEFAULT_SYSTEM_PROMPT. genai.configure должен быть вызван до первого вызова.
-_models: dict[str, genai.GenerativeModel] = {}
+# Один экземпляр модели на процесс: у ChatGoogleGenerativeAI нет системного
+# промпта в конструкторе, его хранит ChatSession (см. ниже). Ключ берётся из
+# GOOGLE_API_KEY или GEMINI_API_KEY (как в .env бота). temperature=None —
+# как в старом цикле: конфиг генерации не отправлялся, действует серверный
+# дефолт (в LangChain дефолт 0.7 — это изменение поведения).
+_model: ChatGoogleGenerativeAI | None = None
 
 
 def get_model(system_prompt=None):
-    """Модель с инструментами агента; system_prompt=None → DEFAULT_SYSTEM_PROMPT."""
-    key = system_prompt or DEFAULT_SYSTEM_PROMPT
-    if key not in _models:
-        _models[key] = genai.GenerativeModel(
-            model_name=MODEL_NAME, system_instruction=key, tools=TOOLS
-        )
-    return _models[key]
+    """Модель агента; системный промпт (если есть) живёт в ChatSession."""
+    global _model
+    if _model is None:
+        _model = ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=None)
+    return _model
 
 
 # --- ИНСТРУМЕНТЫ ---
@@ -236,53 +184,66 @@ def create_lead(name, phone, service, message, *, default_phone=None, record_lea
 
 
 def _execute_tool(name, args, client_id, record_lead):
-    """Выполняет инструмент по имени; возвращает dict для FunctionResponse."""
+    """Выполняет инструмент по имени; возвращает текст результата для модели."""
     if name == "lookup_pricing":
-        return {"result": lookup_pricing(args.get("service"))}
+        return lookup_pricing(args.get("service"))
     if name == "create_lead":
-        return {
-            "result": create_lead(
-                args.get("name"), args.get("phone"), args.get("service"),
-                args.get("message"), default_phone=client_id, record_lead=record_lead,
-            )
-        }
-    return {"result": f"Ошибка: неизвестный инструмент «{name}»."}
-
-
-def _execute_calls(calls, client_id, record_lead, result):
-    """Выполняет function_calls и возвращает parts FunctionResponse для сессии.
-
-    Дубль create_lead в одном цикле не выполняется (result.lead_saved уже
-    True): заявка в таблице, повторный вызов задвоил бы лида. Об успехе
-    судим по тексту инструмента: ошибки валидации начинаются с «Ошибка:»
-    и не закрывают сессию.
-    """
-    feedback = []
-    for call in calls:
-        args = call.args or {}
-        if call.name == "create_lead" and result.lead_saved:
-            outcome = {
-                "result": (
-                    "Заявка уже сохранена ранее. Поблагодари клиента и скажи, "
-                    "что менеджер свяжется с ним."
-                )
-            }
-        else:
-            outcome = _execute_tool(call.name, args, client_id, record_lead)
-        if call.name == "create_lead" and not outcome["result"].startswith("Ошибка:"):
-            result.lead_saved = True
-        result.tool_calls.append((call.name, args, outcome["result"]))
-        feedback.append(
-            genai.protos.Part(
-                function_response=genai.protos.FunctionResponse(
-                    name=call.name, response=outcome,
-                )
-            )
+        return create_lead(
+            args.get("name"), args.get("phone"), args.get("service"),
+            args.get("message"), default_phone=client_id, record_lead=record_lead,
         )
-    return feedback
+    return f"Ошибка: неизвестный инструмент «{name}»."
 
 
-# --- АГЕНТ-ЦИКЛ ---
+# Декларации инструментов для модели: pydantic-схемы аргументов + docstring =
+# описание функции. Тексты те же, что были в легаси-декларациях TOOLS
+# google-generativeai (0.8.x).
+class _LookupPricingArgs(BaseModel):
+    service: str = Field(
+        description=(
+            "Название услуги/материала (металлочерепица, "
+            "профнастил, фальц, мягкая кровля и т.п.)"
+        )
+    )
+
+
+class _CreateLeadArgs(BaseModel):
+    name: str = Field(description="Имя клиента")
+    phone: str = Field(
+        default="",
+        description=(
+            "Телефон клиента в международном формате. "
+            "Можно не указывать — подставится номер клиента автоматически"
+        ),
+    )
+    service: str = Field(description="Услуга/материал, который интересует клиента")
+    message: str = Field(description="Краткое описание запроса клиента")
+
+
+def _make_tools(client_id, record_lead):
+    """Инструменты одного прогона: create_lead замыкается на client_id и
+    record_lead этого сообщения (всё как в _execute_calls старого цикла)."""
+
+    @tool("lookup_pricing", args_schema=_LookupPricingArgs)
+    def lookup_pricing_tool(service: str) -> str:
+        """Цена услуги за кв.м из прайс-листа компании. Вызывай,
+        когда клиент спрашивает цену или стоимость услуги."""
+        return lookup_pricing(service)
+
+    @tool("create_lead", args_schema=_CreateLeadArgs)
+    def create_lead_tool(name: str, phone: str, service: str, message: str) -> str:
+        """Сохранить лид клиента: имя, телефон, услуга, сообщение.
+        Вызывай, когда клиент готов оставить заявку или подтвердил заказ.
+        Телефон можно не указывать — подставится номер клиента автоматически."""
+        return create_lead(
+            name, phone, service, message,
+            default_phone=client_id, record_lead=record_lead,
+        )
+
+    return [lookup_pricing_tool, create_lead_tool]
+
+
+# --- СЕССИЯ И ГРАФ ---
 
 
 @dataclass
@@ -294,12 +255,171 @@ class AgentResult:
     hits: list = None           # чанки базы знаний первого хода — для CLI
 
 
-def _content_parts(response):
-    candidate = getattr(response, "candidates", None)
-    if not candidate:
-        return []
-    content = getattr(candidate[0], "content", None)
-    return getattr(content, "parts", []) if content else []
+def message_text(message) -> str:
+    """Текст сообщения модели: строка или список text-блоков Gemini 3+."""
+    if isinstance(message, str):
+        return message
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    return "".join(
+        block.get("text", "") for block in (content or [])
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+def _from_disk_history(history):
+    """Дисковая история [{"role": "user"|"model", "parts": [текст]}] → LangChain."""
+    messages = []
+    for item in history:
+        text = "\n".join(str(p) for p in item.get("parts", []))
+        if item.get("role") == "user":
+            messages.append(HumanMessage(content=text))
+        elif item.get("role") == "model":
+            messages.append(AIMessage(content=text))
+        else:
+            raise ValueError(f"Неизвестная роль в истории: {item.get('role')!r}")
+    return messages
+
+
+class ChatSession:
+    """Сессия диалога: модель + системный промпт + история (LangChain-сообщения).
+
+    Заменяет genai ChatSession: история в chat.messages, системный промпт —
+    отдельным полем (у ChatGoogleGenerativeAI его нет в конструкторе).
+    send_message не трогает лимитер — это работа вызывающего кода, как было
+    с chat.send_message в старом цикле и follow-up.
+    """
+
+    def __init__(self, model, system_prompt=None, history=None):
+        self.model = model
+        self.system_prompt = system_prompt
+        self.messages = _from_disk_history(history) if history else []
+
+    def send_message(self, message):
+        """Один ход: сообщение (строка или HumanMessage) + ответ модели."""
+        if isinstance(message, str):
+            message = HumanMessage(content=message)
+        msgs = list(self.messages)
+        if self.system_prompt:
+            msgs.insert(0, SystemMessage(content=self.system_prompt))
+        msgs.append(message)
+        response = self.model.invoke(msgs)
+        self.messages.append(message)
+        self.messages.append(response)
+        return response
+
+
+class _GraphState(TypedDict, total=False):
+    session: ChatSession
+    client_id: str
+    user_message: str
+    audio_data: bytes
+    mime_type: str
+    record_lead: Any
+    kb_top_k: int
+    tools: list
+    result: AgentResult
+    turns: int
+    messages: list
+
+
+def _retrieve_node(state):
+    """Первый ход: RAG-контекст для текста, сырое аудио для голоса."""
+    session = state["session"]
+    if state.get("audio_data") is not None:
+        b64 = base64.b64encode(state["audio_data"]).decode("ascii")
+        first = HumanMessage(content=[
+            {"type": "audio", "base64": b64, "mime_type": state.get("mime_type")}
+        ])
+        hits = None
+    else:
+        question = state["user_message"]
+        try:
+            hits = rag_retrieve.retrieve(
+                question, state["client_id"], k=state.get("kb_top_k", KB_TOP_K)
+            )
+            first = HumanMessage(content=build_rag_message(question, hits))
+        except Exception as e:
+            print(f"[RAG RETRIEVE ERROR] {state['client_id']}: {e}")
+            first, hits = HumanMessage(content=question), None
+    state["result"].hits = hits
+    return {"messages": list(session.messages) + [first]}
+
+
+def _model_node(state):
+    """Один ход модели: системный промпт + история → ответ с инструментами."""
+    session = state["session"]
+    msgs = list(state["messages"])
+    if session.system_prompt:
+        msgs.insert(0, SystemMessage(content=session.system_prompt))
+    gemini_rate_limiter.acquire()
+    response = session.model.bind_tools(state["tools"]).invoke(msgs)
+    return {
+        "messages": state["messages"] + [response],
+        "turns": state.get("turns", 0) + 1,
+    }
+
+
+def _route_after_model(state):
+    """Есть function_calls в ответе — выполняем инструменты, иначе всё."""
+    last = state["messages"][-1]
+    return "tools" if getattr(last, "tool_calls", None) else END
+
+
+def _tools_node(state):
+    """Выполняет function_calls модели; результаты — ToolMessage в историю.
+
+    Дубль create_lead в одном цикле не выполняется (result.lead_saved уже
+    True): заявка в таблице, повторный вызов задвоил бы лида. Об успехе
+    судим по тексту инструмента: ошибки валидации начинаются с «Ошибка:»
+    и не закрывают сессию.
+    """
+    result = state["result"]
+    last = state["messages"][-1]
+    messages = list(state["messages"])
+    for call in last.tool_calls:
+        name = call["name"]
+        args = call.get("args") or {}
+        if name == "create_lead" and result.lead_saved:
+            outcome = (
+                "Заявка уже сохранена ранее. Поблагодари клиента и скажи, "
+                "что менеджер свяжется с ним."
+            )
+        else:
+            outcome = _execute_tool(name, args, state["client_id"], state.get("record_lead"))
+        if name == "create_lead" and not outcome.startswith("Ошибка:"):
+            result.lead_saved = True
+        result.tool_calls.append((name, args, outcome))
+        # ToolMessage → FunctionResponse(name, response={"result": ...}) — та же
+        # форма результата, что получала модель в старом цикле.
+        messages.append(ToolMessage(
+            content=json.dumps({"result": outcome}, ensure_ascii=False),
+            tool_call_id=call["id"],
+        ))
+    return {"messages": messages}
+
+
+def _route_after_tools(state):
+    """Ответы инструментов обратно модели; на MAX_TURNS останавливаемся —
+    невыполненные calls (create_lead в самом конце) уже выполнены здесь,
+    без нового обращения к Gemini, чтобы заявка не потерялась."""
+    return "model" if state.get("turns", 0) < MAX_TURNS else END
+
+
+def _build_graph():
+    g = StateGraph(_GraphState)
+    g.add_node("retrieve", _retrieve_node)
+    g.add_node("model", _model_node)
+    g.add_node("tools", _tools_node)
+    g.add_edge(START, "retrieve")
+    g.add_edge("retrieve", "model")
+    g.add_conditional_edges("model", _route_after_model)
+    g.add_conditional_edges("tools", _route_after_tools)
+    return g.compile()
+
+
+_graph = _build_graph()
 
 
 def run_agent(chat, client_id, *, user_message=None, audio_data=None,
@@ -307,53 +427,30 @@ def run_agent(chat, client_id, *, user_message=None, audio_data=None,
     """Полный агент-цикл для одного сообщения клиента в сессии chat.
 
     Первый ход: текст оборачивается контекстом базы знаний (то, что делал
-    build_message_with_kb в шаге 2), аудио идёт сырыми parts. Дальше до
+    build_message_with_kb в шаге 2), аудио идёт base64-блоком. Дальше до
     MAX_TURNS обращений к Gemini: ответ с function_call → выполнение
-    инструмента → результат обратно в сессию → следующий ход.
+    инструмента → результат обратно → следующий ход.
 
     Вызывается под per-phone lock бота (main.handle_single_message), поэтому
     параллельных вызовов на одну сессию нет; лимитер Gemini общий на все потоки.
     """
-    if audio_data is not None:
-        first_message = [{"mime_type": mime_type, "data": audio_data}]
-        hits = None
-    else:
-        try:
-            hits = rag_retrieve.retrieve(user_message, client_id, k=kb_top_k)
-            first_message = build_rag_message(user_message, hits)
-        except Exception as e:
-            print(f"[RAG RETRIEVE ERROR] {client_id}: {e}")
-            first_message, hits = user_message, None
-
-    result = AgentResult(hits=hits)
-    gemini_rate_limiter.acquire()
-    response = chat.send_message(first_message)
-
-    for _ in range(MAX_TURNS - 1):
-        parts = _content_parts(response)
-        calls = [
-            p.function_call for p in parts
-            if getattr(p, "function_call", None) and p.function_call.name
-        ]
-        if not calls:
-            break
-        feedback = _execute_calls(calls, client_id, record_lead, result)
-        gemini_rate_limiter.acquire()
-        response = chat.send_message(genai.protos.Content(parts=feedback))
-
-    # Цикл мог исчерпать MAX_TURNS, когда в последнем ответе модели остались
-    # невыполненные function_calls (например, create_lead в самом конце) —
-    # выполняем их без нового обращения к Gemini, чтобы заявка не потерялась.
-    # В сессию результат не отправляем: обращений больше не будет, а лишний
-    # user-контент в истории ничем не помогает.
-    trailing_calls = [
-        p.function_call for p in _content_parts(response)
-        if getattr(p, "function_call", None) and p.function_call.name
-    ]
-    if trailing_calls:
-        _execute_calls(trailing_calls, client_id, record_lead, result)
-
-    result.text = getattr(response, "text", None) or ""
+    result = AgentResult()
+    state = {
+        "session": chat,
+        "client_id": client_id,
+        "user_message": user_message,
+        "audio_data": audio_data,
+        "mime_type": mime_type,
+        "record_lead": record_lead,
+        "kb_top_k": kb_top_k,
+        "tools": _make_tools(client_id, record_lead),
+        "result": result,
+        "turns": 0,
+    }
+    final = _graph.invoke(state)
+    chat.messages = final["messages"]
+    last_ai = next((m for m in reversed(final["messages"]) if isinstance(m, AIMessage)), None)
+    result.text = message_text(last_ai) if last_ai else ""
     # Лид сохранён, а текст не пришёл (модель позвала create_lead последним
     # ходом и цикл исчерпал MAX_TURNS) — клиенту нужен ответ, а не "ошибка":
     # заявка уже в таблице, сессию закроет вызывающий код по lead_saved.
