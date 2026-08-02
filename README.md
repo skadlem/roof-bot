@@ -72,21 +72,18 @@ Two pipelines feed the bot. Write real facts in `kb/*.md` — one topic per file
 venv\Scripts\python.exe -m rag.ingest
 ```
 
-Idempotent: re-running only re-embeds changed sources (per-source sha256). Sheet rows get `client_id = phone`; kb facts are shared across all clients. Query it with:
+Idempotent: re-running only re-embeds changed sources (per-source sha256). Sheet rows get `client_id = phone`; kb facts are shared across all clients. This is the pipeline the bot uses at runtime: every text message retrieves the closest chunks for the client's phone and sends them to Gemini as context (only chunks above the similarity threshold — `RAG_SIMILARITY_THRESHOLD` in `rag/prompts.py`). Try it manually:
 
 ```bash
 venv\Scripts\python.exe -m rag.retrieve "how much does metal tile cost" <client_id>
+venv\Scripts\python.exe -m rag.ask "how much does metal tile cost" <client_id>   # bot flow: context → Gemini answer + sources
 ```
 
-Needs `GEMINI_API_KEY` and `SHEET_KEY` in `.env`, plus `google_credentials.json`. This pipeline is not wired into the bot yet — it's the replacement for `build_kb.py`.
+Needs `GEMINI_API_KEY` and `SHEET_KEY` in `.env`, plus `google_credentials.json`.
 
-**`build_kb.py` (current runtime)** — chunks the same `kb/*.md` files and writes `kb_embeddings.json` (gitignored). The bot loads it at startup and sends the closest facts to Gemini as context for text messages:
+**`build_kb.py` (legacy, no longer loaded)** — the previous retrieval path (`kb_embeddings.json`, `gemini-embedding-001`). The bot stopped loading it when `rag/` was wired in; keep the file only for reference.
 
-```bash
-venv\Scripts\python.exe build_kb.py
-```
-
-If the knowledge base is missing or empty, retrieval is disabled: the bot never invents prices, services, timelines, delivery zones, or guarantees — it says it will check with a manager. Voice messages never trigger retrieval.
+If the knowledge base is missing or no chunk is above the threshold, retrieval is disabled: the bot never invents prices, services, timelines, delivery zones, or guarantees — it says it will check with a manager. Voice messages never trigger retrieval.
 
 ## Run
 

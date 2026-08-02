@@ -3,10 +3,10 @@
 All embeddings are faked — zero network, zero real API calls.
 """
 
-import google.generativeai as genai
 import pytest
 
 import build_kb
+from rag import retrieve as rag_retrieve
 from tests.helpers import make_text_message
 
 GARANTY = "Гарантия на кровельные работы — 5 лет."
@@ -43,59 +43,48 @@ def test_read_kb_files_skips_readme(tmp_path):
     assert chunks == ["Мы делаем монтаж кровли под ключ."]
 
 
-# --- retrieval (main) ---
+# --- retrieval (main → rag/) ---
 
 
 @pytest.fixture
-def fake_kb(main):
-    """Три ортогональных факта + фейковые эмбеддинги по ключевым словам."""
-    kb = {"chunks": ["гарантия: 5 лет", "доставка: бесплатно", "срок: 2 недели"],
-          "vectors": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]}
+def fake_rag(main, monkeypatch):
+    """Фейковый rag.retrieve.retrieve: факты по ключевым словам вопроса.
 
-    def fake_embed_content(model, content, **kwargs):
-        word = next((w for w in ("гарант", "доставк", "срок") if w in content), None)
-        vec = {"гарант": [1, 0, 0], "доставк": [0, 1, 0], "срок": [0, 0, 1]}.get(word, [0, 0, 0])
-        return {"embedding": vec}
+    Слово не совпало — чанк со score 0.2 (ниже порога RAG_SIMILARITY_THRESHOLD).
+    """
+    FACTS = {
+        "гарант": ("гарантия: 5 лет", "kb/faq.md"),
+        "доставк": ("доставка: бесплатно", "kb/faq.md"),
+        "срок": ("срок: 2 недели", "kb/faq.md"),
+    }
 
-    monkey = pytest.MonkeyPatch()
-    monkey.setattr(genai, "embed_content", fake_embed_content)
-    old_kb = main.KB
-    main.KB = kb
-    yield kb
-    main.KB = old_kb
-    monkey.undo()
+    def fake_retrieve(question, client_id, k=4):
+        word = next((w for w in FACTS if w in question), None)
+        if not word:
+            return [{"text": "посторонний чанк", "score": 0.2,
+                     "source": "kb/faq.md", "client_id": "all"}]
+        text, source = FACTS[word]
+        return [{"text": text, "score": 0.9, "source": source, "client_id": "all"}]
 
-
-def test_retrieve_kb_returns_matching_fact(main, fake_kb):
-    assert "гарантия: 5 лет" in main.retrieve_kb("какая у вас гарантия?")
-
-
-def test_retrieve_kb_below_threshold_returns_empty(main, fake_kb):
-    assert main.retrieve_kb("совершенно посторонний вопрос") == ""
+    monkeypatch.setattr(rag_retrieve, "retrieve", fake_retrieve)
 
 
-def test_retrieve_kb_none_returns_empty(main, monkeypatch):
-    monkeypatch.setattr(main, "KB", None)
-    assert main.retrieve_kb("что-нибудь") == ""
-
-
-def test_retrieve_kb_embed_exception_returns_empty(main, fake_kb, monkeypatch):
-    def boom(model, content, **kwargs):
-        raise RuntimeError("no api")
-    monkeypatch.setattr(genai, "embed_content", boom)
-    assert main.retrieve_kb("гарантия") == ""
-
-
-def test_build_message_with_kb_formats_context(main, fake_kb):
-    result = main.build_message_with_kb("какая гарантия?")
-    assert result.startswith("БАЗА ЗНАНИЙ КОМПАНИИ")
+def test_build_message_with_kb_formats_context(main, fake_rag):
+    result = main.build_message_with_kb("какая гарантия?", "79990000000")
     assert "гарантия: 5 лет" in result
+    assert "[kb/faq.md]" in result
     assert result.endswith("какая гарантия?")
-    assert "\n\n" in result
 
 
-def test_build_message_with_kb_no_match_returns_original(main, fake_kb):
-    assert main.build_message_with_kb("здравствуйте") == "здравствуйте"
+def test_build_message_with_kb_below_threshold_returns_original(main, fake_rag):
+    assert main.build_message_with_kb("здравствуйте", "79990000000") == "здравствуйте"
+
+
+def test_build_message_with_kb_retrieve_exception_returns_original(main, monkeypatch):
+    def boom(question, client_id, k=4):
+        raise RuntimeError("no api")
+    monkeypatch.setattr(rag_retrieve, "retrieve", boom)
+    assert main.build_message_with_kb("гарантия", "79990000000") == "гарантия"
 
 
 def test_system_prompt_defers_to_manager(main):
@@ -106,21 +95,20 @@ def test_system_prompt_defers_to_manager(main):
 # --- wiring (webhook → Gemini) ---
 
 
-def test_text_message_sends_kb_context(main, fake_kb, gemini, outbox):
+def test_text_message_sends_kb_context(main, fake_rag, gemini, outbox):
     main.handle_single_message(
         make_text_message("79990000000", "какая у вас гарантия на кровлю?")
     )
     sent = gemini.sent_messages[0][0][0]
-    assert sent.startswith("БАЗА ЗНАНИЙ КОМПАНИИ")
     assert "гарантия: 5 лет" in sent
 
 
-def test_text_message_without_match_is_unchanged(main, fake_kb, gemini, outbox):
+def test_text_message_without_match_is_unchanged(main, fake_rag, gemini, outbox):
     main.handle_single_message(make_text_message("79990000000", "здравствуйте"))
     assert gemini.sent_messages[0][0][0] == "здравствуйте"
 
 
-def test_voice_message_skips_kb(main, fake_kb, gemini, outbox, monkeypatch):
+def test_voice_message_skips_kb(main, fake_rag, gemini, outbox, monkeypatch):
     # сериализация аудио-истории — отдельная история; здесь проверяем только
     # что голосовой путь не ходит в базу знаний
     monkeypatch.setattr(main, "serialize_chat_history", lambda chat: [])

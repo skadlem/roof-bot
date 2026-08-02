@@ -15,6 +15,9 @@ from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
+from rag import retrieve as rag_retrieve
+from rag.prompts import build_rag_message
+
 LEADS_FILE = "open_leads.json"
 
 # Реентрантная блокировка — защищает open_leads И chat_sessions от гонок,
@@ -163,76 +166,24 @@ PRICES = load_prices()
 prices_text = "\n".join([f"- {k}: {v} тг за кв.м" for k, v in PRICES.items()])
 
 # --- БАЗА ЗНАНИЙ (RAG) ---
-# kb_embeddings.json собирается скриптом build_kb.py из kb/*.md.
-# Файла нет или он пуст → KB = None, поиск фактов отключён, бот не падает.
-KB_EMBEDDINGS_FILE = "kb_embeddings.json"
-KB_SIMILARITY_THRESHOLD = 0.3
+# Коллекция ChromaDB собирается rag/ingest.py из kb/*.md и Google Sheets.
+# Сборка сообщения с контекстом — rag/prompts.py; порог близости там же.
 KB_TOP_K = 3
-KB = None
 
 
-def load_kb():
-    global KB
+def build_message_with_kb(user_message, client_id):
+    """Подставляет в сообщение клиента факты из RAG-базы (rag/, ChromaDB).
+
+    Чанки ниже порога близости (rag.prompts.RAG_SIMILARITY_THRESHOLD)
+    отбрасываются; контекста нет — бот не угадывает, а отвечает по правилу
+    системного промпта («уточню у менеджера»).
+    """
     try:
-        with open(KB_EMBEDDINGS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not data.get("chunks") or not data.get("vectors"):
-            return None
-        KB = data
+        hits = rag_retrieve.retrieve(user_message, client_id, k=KB_TOP_K)
+        return build_rag_message(user_message, hits)
     except Exception as e:
-        print(f"Не удалось загрузить {KB_EMBEDDINGS_FILE}: {e}")
-        KB = None
-    return KB
-
-
-def _cosine_similarity(a, b):
-    if len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = sum(x * x for x in a) ** 0.5
-    norm_b = sum(y * y for y in b) ** 0.5
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-
-def retrieve_kb(query, k=KB_TOP_K):
-    """Возвращает до k фактов базы знаний, близких к запросу, или ""."""
-    if KB is None:
-        return ""
-    try:
-        result = genai.embed_content(
-            model="models/gemini-embedding-001",
-            content=query,
-            task_type="RETRIEVAL_QUERY",
-        )
-        query_vec = result["embedding"]
-    except Exception as e:
-        print(f"[KB EMBED ERROR] {e}")
-        return ""
-    scored = sorted(
-        ((_cosine_similarity(query_vec, v), i) for i, v in enumerate(KB["vectors"])),
-        reverse=True,
-    )
-    hits = []
-    for score, i in scored:
-        if score < KB_SIMILARITY_THRESHOLD:
-            break
-        hits.append(KB["chunks"][i])
-        if len(hits) >= k:
-            break
-    return "\n\n".join(hits)
-
-
-def build_message_with_kb(user_message):
-    """Подставляет факты базы знаний в сообщение клиента как контекст для Gemini."""
-    context = retrieve_kb(user_message)
-    if not context:
+        print(f"[RAG RETRIEVE ERROR] {client_id}: {e}")
         return user_message
-    return (
-        "БАЗА ЗНАНИЙ КОМПАНИИ (не цитируй дословно, используй только эти факты):\n"
-        f"{context}\n\n{user_message}"
-    )
 
 
 app = FastAPI()
@@ -617,7 +568,7 @@ def process_gemini_response(phone_number, user_message=None, audio_data=None, mi
 
     if user_message:
         log_chat_to_file(phone_number, "Клиент", user_message)
-        user_message = build_message_with_kb(user_message)
+        user_message = build_message_with_kb(user_message, phone_number)
         try:
             gemini_rate_limiter.acquire()
             response = chat.send_message(user_message)
