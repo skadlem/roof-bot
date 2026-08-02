@@ -2,14 +2,47 @@
 
 [![CI](https://github.com/skadlem/roof-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/skadlem/roof-bot/actions/workflows/ci.yml)
 
-WhatsApp bot for roofing installation leads. Talks to customers in Russian, collects lead details (roofing type, area, phone number), saves leads and sends follow-ups to warm leads.
+**A WhatsApp sales manager for a roofing company.** It picks up every incoming message in Russian, runs a full SPIN sales conversation, prices the job live from your price list, and hands every confirmed order to you in Google Sheets and on your own WhatsApp.
 
-## How it works
+## What it does
 
-- **WhatsApp Cloud API** (Meta) — receiving/sending messages via webhook
-- **Gemini API** — AI conversation with the customer
+- **Sells by itself** — Gemini AI drives the conversation with a real sales script (diagnosis → pain discovery → mirror presentation → objection handling → close), tuned for roofing: object type, build stage, roof area and geometry, deadlines.
+- **Prices on the spot** — loads your price list (`prices.json`, ₸/m²) and calculates the customer's total mid-conversation (price × area), named and quoted before the close.
+- **Understands voice messages** — customers can send audio; the bot downloads it from WhatsApp and transcribes it.
+- **Writes like a human** — short messenger-style replies, one question per message, no lists, no emoji spam, no fake urgency. Follows up on objections without pressure.
+- **Captures the full order** — name, material, color, area, final price, delivery address — and finalizes it in one message.
+- **Delivers every lead to you** — each order is duplicated to the owner's WhatsApp and appended to a Google Sheet for your CRM / bookkeeping.
+- **Follows up cold leads** — APScheduler sends one polite reminder after 4 hours of silence, then leaves the customer alone.
+- **Safe by default** — verifies the Meta webhook signature on every request, deduplicates webhook deliveries, rate-limits per customer, and logs every conversation to a per-phone-number file.
+
+## How a conversation goes
+
+1. A customer writes (or sends a voice message) to your WhatsApp number.
+2. The bot introduces itself once — "Вы обратились в компанию МеталлКровля, я виртуальный менеджер по кровле" — and starts diagnosing: what's the object, what stage is the build, what area and shape, what's the deadline.
+3. It finds what already annoyed the customer with other contractors (price, terms, trust) and mirrors their own words back in the offer.
+4. Objections like "дорого" or "подумаю" get handled with a formula — agree → clarify → counter → small step — never pressure.
+5. On confirmation it calculates the total and creates the order.
+6. The order lands in Google Sheets and on the owner's phone; the customer gets a clean goodbye.
+
+## How it's built
+
+```
+Customer ──▶ WhatsApp Cloud API ──▶ FastAPI webhook ──▶ Gemini (text + voice)
+    ▲                                   │
+    └──────────── reply via API ◄───────┘
+                                        │
+                    ┌───────────────────┴────────────────────┐
+                    ▼                                        ▼
+         Google Sheets (lead export)          Owner's WhatsApp (order copy)
+                    ▲
+                    └── APScheduler: one follow-up after 4h of silence
+```
+
+- **FastAPI** — webhook endpoint, signature verification, message dedup
+- **WhatsApp Cloud API (Meta)** — send/receive messages, download voice audio
+- **Gemini API** — the sales brain, driven by a full system-prompt sales script
 - **Google Sheets (gspread)** — lead export
-- **APScheduler** — follow-ups for unanswered leads
+- **APScheduler** — 4-hour follow-up for unanswered leads
 
 ## Installation
 
@@ -26,6 +59,7 @@ pip install -r requirements.txt
    - `WA_TOKEN`, `WA_PHONE_ID`, `WA_VERIFY_TOKEN`, `WA_APP_SECRET` — WhatsApp Cloud API settings
    - `OWNER_PHONE_NUMBER` — owner's phone number, leads are duplicated to it
 2. Place `google_credentials.json` (Google Sheets service account) in the repo root.
+3. Put your prices in `prices.json` (₸ per m²) — the bot quotes them in conversation.
 
 ## Run
 
