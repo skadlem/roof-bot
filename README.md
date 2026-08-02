@@ -93,7 +93,7 @@ Every message runs through a small agent loop (`rag/agent.py`): the first Gemini
 Two tools:
 
 - `lookup_pricing(service)` — exact price per m² from `prices.json`, the same live file embedded in the system prompt (the copy in `kb/faq.md` is stale). The model is told to quote prices only through this tool.
-- `create_lead(name, phone, service, message)` — appends the lead row to the Google Sheet. It validates: name non-empty, phone 7–15 digits (falls back to the customer's own number if the model didn't pass one). A validation error goes back to the model to relay — a bad lead never reaches the sheet and the conversation stays open. A saved lead closes the session.
+- `create_lead(name, service, message)` — appends the lead row to the Google Sheet. The phone is optional: if the model doesn't pass one, the customer's own WhatsApp number is used (validated 7–15 digits). The prompt is hardened so an order means the call: name + material + area in the message counts as an order — no asking for confirmation, no "the manager will call you" without the call. A validation error goes back to the model to relay — a bad lead never reaches the sheet and the conversation stays open. A saved lead closes the session.
 
 ## Run
 
@@ -102,6 +102,17 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 Point the WhatsApp webhook at `https://<your-domain>/webhook`. Running locally — expose with a tunnel (`ngrok http 8000`) and use the ngrok URL in the Meta dashboard; update it there if the URL changes.
+
+## Evaluations
+
+A golden set of 24 question/answer pairs (`evals/golden_set.jsonl`) runs the real bot prompt through the agent loop (`rag/agent.py`) without WhatsApp or Sheets (leads are validated but never written), then a Gemini judge scores each answer twice — grounded (nothing beyond the retrieved context / tool results) and correct (semantically matches the expected answer). The judge prompt lives in `evals/judge_prompt.txt` and can be edited without touching code.
+
+```bash
+$env:GEMINI_RPM = "10"          # PowerShell: keep under the free-tier 15 rpm burst limit
+venv\Scripts\python.exe -m evals.run_evals
+```
+
+Prints a pass-rate table (overall and per kb/tools group) and the worst failed cases. Exit code 1 if grounded or correct is below 70%, 2 if cases couldn't be evaluated. Current: **grounded 96%, correct 79% (24 cases), exit 0** — kb 100%/100%, tools 95%/74%.
 
 ## Testing
 
