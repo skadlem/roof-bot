@@ -8,6 +8,9 @@ chats_logs/
 open_leads.json
 seen_messages.json
 
+# knowledge base build output (rebuild with venv\Scripts\python.exe build_kb.py)
+kb_embeddings.json
+
 # python
 venv/
 __pycache__/

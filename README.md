@@ -61,6 +61,18 @@ pip install -r requirements.txt
 2. Place `google_credentials.json` (Google Sheets service account) in the repo root.
 3. Put your prices in `prices.json` (₸ per m²) — the bot quotes them in conversation.
 
+## Knowledge base (RAG)
+
+The bot answers factual questions (services, timelines, delivery areas, guarantees) from `kb/*.md` instead of guessing. Write real facts there — one topic per file, one fact per paragraph (see `kb/README.md` for the format and what to fill in), then rebuild:
+
+```bash
+venv\Scripts\python.exe build_kb.py
+```
+
+The build chunks the files, embeds them (needs `GOOGLE_API_KEY` or `GEMINI_API_KEY` in `.env`), and writes `kb_embeddings.json` (gitignored). The bot loads it at startup and sends the closest facts to Gemini as context for text messages.
+
+If the knowledge base is missing or empty, retrieval is disabled: the bot never invents prices, services, timelines, delivery zones, or guarantees — it says it will check with a manager. Voice messages never trigger retrieval.
+
 ## Run
 
 ```bash
