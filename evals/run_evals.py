@@ -67,6 +67,9 @@ def run_case(case):
         record_lead=None,  # лиды никуда не пишутся
     )
     evidence = {
+        # прайс-лист — легитимный источник бота: он вшит в системный промпт,
+        # lookup_pricing возвращает те же цифры (см. rag/prompts.py)
+        "price_list": prices_text,
         "retrieved": [
             {"source": h["source"], "text": h["text"], "score": round(h["score"], 3)}
             for h in result.hits
