@@ -224,7 +224,11 @@ def create_lead(name, phone, service, message, *, default_phone=None, record_lea
         "address": (message or "").strip() or "Самовывоз",
     }
     if record_lead:
-        record_lead(order_data)
+        if record_lead(order_data) is False:
+            # хук вернул явный False (таблица недоступна) — клиенту уходит
+            # ошибка, сессия не закрывается, лид можно повторить.
+            # None (например, list.append) считается успехом.
+            return "Ошибка: не удалось сохранить заявку. Попробуйте отправить её ещё раз."
     text = f"Лид сохранён: {name}, {phone}"
     if order_data["material"]:
         text += f", услуга: {order_data['material']}"
@@ -243,6 +247,39 @@ def _execute_tool(name, args, client_id, record_lead):
             )
         }
     return {"result": f"Ошибка: неизвестный инструмент «{name}»."}
+
+
+def _execute_calls(calls, client_id, record_lead, result):
+    """Выполняет function_calls и возвращает parts FunctionResponse для сессии.
+
+    Дубль create_lead в одном цикле не выполняется (result.lead_saved уже
+    True): заявка в таблице, повторный вызов задвоил бы лида. Об успехе
+    судим по тексту инструмента: ошибки валидации начинаются с «Ошибка:»
+    и не закрывают сессию.
+    """
+    feedback = []
+    for call in calls:
+        args = call.args or {}
+        if call.name == "create_lead" and result.lead_saved:
+            outcome = {
+                "result": (
+                    "Заявка уже сохранена ранее. Поблагодари клиента и скажи, "
+                    "что менеджер свяжется с ним."
+                )
+            }
+        else:
+            outcome = _execute_tool(call.name, args, client_id, record_lead)
+        if call.name == "create_lead" and not outcome["result"].startswith("Ошибка:"):
+            result.lead_saved = True
+        result.tool_calls.append((call.name, args, outcome["result"]))
+        feedback.append(
+            genai.protos.Part(
+                function_response=genai.protos.FunctionResponse(
+                    name=call.name, response=outcome,
+                )
+            )
+        )
+    return feedback
 
 
 # --- АГЕНТ-ЦИКЛ ---
@@ -300,24 +337,21 @@ def run_agent(chat, client_id, *, user_message=None, audio_data=None,
         ]
         if not calls:
             break
-        feedback = []
-        for call in calls:
-            args = call.args or {}
-            outcome = _execute_tool(call.name, args, client_id, record_lead)
-            # об успехе судим по тексту инструмента: ошибки валидации начинаются
-            # с "Ошибка:" — они не закрывают сессию и пишутся в таблицу
-            if call.name == "create_lead" and not outcome["result"].startswith("Ошибка:"):
-                result.lead_saved = True
-            result.tool_calls.append((call.name, args, outcome["result"]))
-            feedback.append(
-                genai.protos.Part(
-                    function_response=genai.protos.FunctionResponse(
-                        name=call.name, response=outcome,
-                    )
-                )
-            )
+        feedback = _execute_calls(calls, client_id, record_lead, result)
         gemini_rate_limiter.acquire()
         response = chat.send_message(genai.protos.Content(parts=feedback))
+
+    # Цикл мог исчерпать MAX_TURNS, когда в последнем ответе модели остались
+    # невыполненные function_calls (например, create_lead в самом конце) —
+    # выполняем их без нового обращения к Gemini, чтобы заявка не потерялась.
+    # В сессию результат не отправляем: обращений больше не будет, а лишний
+    # user-контент в истории ничем не помогает.
+    trailing_calls = [
+        p.function_call for p in _content_parts(response)
+        if getattr(p, "function_call", None) and p.function_call.name
+    ]
+    if trailing_calls:
+        _execute_calls(trailing_calls, client_id, record_lead, result)
 
     result.text = getattr(response, "text", None) or ""
     # Лид сохранён, а текст не пришёл (модель позвала create_lead последним

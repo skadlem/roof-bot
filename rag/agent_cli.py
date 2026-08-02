@@ -23,6 +23,7 @@ sys.stdin.reconfigure(encoding="utf-8")
 def _record_lead_stub(order_data):
     """Заглушка вместо main.add_to_google_sheets: лид печатается, не пишется."""
     print(f"  [ЛЕД → Google Sheets] {order_data}")
+    return True
 
 
 def _print_result(result):

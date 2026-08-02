@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import asyncio
 import threading
+from contextlib import contextmanager
 import requests
 import gspread
 import google.generativeai as genai
@@ -25,16 +26,38 @@ state_lock = threading.RLock()
 
 # Отдельные локи НА КАЖДЫЙ номер телефона — гарантируют, что два сообщения
 # от ОДНОГО И ТОГО ЖЕ клиента обрабатываются строго по очереди, а не параллельно
-# (иначе можно словить гонку внутри одного Gemini ChatSession).
+# (иначе можно словить гонку внутри одного Gemini ChatSession). Записи
+# рефкаунтятся: когда лок перестают использовать, запись удаляется — иначе
+# словарь рос бы бесконечно (по записи на каждый когда-либо писавший номер).
 _phone_locks_guard = threading.Lock()
-_phone_locks: dict[str, threading.Lock] = {}
+_phone_locks: dict[str, "_PhoneLockEntry"] = {}
 
 
-def get_phone_lock(phone_number: str) -> threading.Lock:
+class _PhoneLockEntry:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.users = 0
+
+
+@contextmanager
+def phone_lock(phone_number):
+    """Контекстный менеджер: `with phone_lock(phone):` — тот же взаимоисключающий
+    лок на номер, что и прежний get_phone_lock, плюс удаление записи из
+    _phone_locks, когда лок освободил последний держатель."""
     with _phone_locks_guard:
-        if phone_number not in _phone_locks:
-            _phone_locks[phone_number] = threading.Lock()
-        return _phone_locks[phone_number]
+        entry = _phone_locks.get(phone_number)
+        if entry is None:
+            entry = _phone_locks[phone_number] = _PhoneLockEntry()
+        entry.users += 1
+    entry.lock.acquire()
+    try:
+        yield
+    finally:
+        entry.lock.release()
+        with _phone_locks_guard:
+            entry.users -= 1
+            if entry.users == 0:
+                _phone_locks.pop(phone_number, None)
 
 
 def load_leads():
@@ -190,8 +213,14 @@ def get_sheet():
     with _sheet_lock:
         if _sheet is None:
             gc = gspread.service_account(filename="google_credentials.json")
-            # ключ из .env (SHEET_KEY); фолбэк для локального запуска без .env
-            _sheet = gc.open_by_key(os.getenv("SHEET_KEY", "11vKc3-d5zhX1-0wnua3blinCh4R6RJBi555JOhHz218")).sheet1
+            sheet_key = os.getenv("SHEET_KEY")
+            if not sheet_key:
+                # ключ таблицы — секрет (репозиторий публичный): только из .env,
+                # никаких захардкоженных фолбэков
+                raise RuntimeError(
+                    "SHEET_KEY не задан в .env — укажите ID таблицы для экспорта лидов"
+                )
+            _sheet = gc.open_by_key(sheet_key).sheet1
         return _sheet
 
 
@@ -233,8 +262,10 @@ def add_to_google_sheets(order_data):
     ]
     try:
         get_sheet().append_row(row)
+        return True
     except Exception as e:
         print(f"[GOOGLE SHEETS ERROR] {e}")
+        return False
 
 
 def _save_lead_to_sheets(order_data):
@@ -242,9 +273,14 @@ def _save_lead_to_sheets(order_data):
 
     Таблица и уведомление владельцу: create_lead вызывает хук только при
     успешной валидации, так что сюда попадают только настоящие лиды.
+    Владелец уведомляется ТОЛЬКО после реальной записи в таблицу — иначе
+    он получит лид, которого в таблице нет. Возвращает успех, чтобы агент
+    не закрывал сессию и не говорил клиенту «заказ оформлен» при сбое.
     """
-    add_to_google_sheets(order_data)
-    send_whatsapp_to_owner(order_data)
+    ok = add_to_google_sheets(order_data)
+    if ok:
+        send_whatsapp_to_owner(order_data)
+    return ok
 
 
 def download_whatsapp_media(media_id: str):
@@ -526,7 +562,7 @@ def handle_single_message(msg: dict) -> None:
         msg_type = msg.get("type")
 
         # Все сообщения одного номера обрабатываются строго последовательно
-        with get_phone_lock(phone_number):
+        with phone_lock(phone_number):
             if msg_type == "text":
                 text = msg["text"]["body"]
                 process_gemini_response(phone_number, user_message=text)
@@ -574,7 +610,9 @@ async def receive_webhook(req: Request):
                 for change in entry.get("changes", []):
                     if change.get("field") == "messages":
                         for msg in change["value"].get("messages", []):
-                            if is_duplicate_message(msg.get("id")):
+                            # is_duplicate_message пишет seen_messages на диск —
+                            # синхронный I/O нельзя держать на event loop
+                            if await asyncio.to_thread(is_duplicate_message, msg.get("id")):
                                 print(
                                     f"[DUPLICATE MESSAGE] {msg.get('id')} — "
                                     "повторная доставка вебхука, пропускаем"
@@ -597,18 +635,25 @@ async def receive_webhook(req: Request):
 
 def check_stale_leads():
     """Проверяет клиентов, которые не отвечали больше 4 часов и отправляет ОДНО напоминание"""
-    current_time = time.time()
     STALE_TIME = 4 * 60 * 60  # 4 часа в секундах
     # Если клиент не ответил даже на follow-up за это время — считаем лида
     # окончательно остывшим и перестаём хранить его состояние, чтобы open_leads
     # и chat_sessions не росли бесконечно.
     MAX_LEAD_AGE = 48 * 60 * 60  # 48 часов
 
-    # Идем по копии словаря, чтобы можно было удалять элементы во время итерации
-    for phone, lead in list(open_leads.items()):
-        last_seen = lead.get("last_seen", current_time)
-        followup_sent = lead.get("followup_sent", False)
-        elapsed_time = current_time - last_seen
+    # Снимок ключей под state_lock: open_leads пишется/чистится другими потоками
+    # (process_gemini_response), итерировать словарь без лока нельзя.
+    with state_lock:
+        phones = list(open_leads.keys())
+
+    for phone in phones:
+        with state_lock:
+            lead = open_leads.get(phone)
+            if lead is None:
+                continue
+            last_seen = lead.get("last_seen", time.time())
+            elapsed_time = time.time() - last_seen
+            followup_sent = lead.get("followup_sent", False)
 
         if elapsed_time > MAX_LEAD_AGE:
             with state_lock:
@@ -619,8 +664,17 @@ def check_stale_leads():
 
         # Если клиент молчит дольше порога и follow-up ещё НЕ отправляли
         if elapsed_time > STALE_TIME and not followup_sent:
-            with get_phone_lock(phone):
+            with phone_lock(phone):
+                # Между снимком и локом клиент мог написать (handle_single_message
+                # берёт тот же лок) — состояние проверяем заново уже под локом
                 with state_lock:
+                    lead = open_leads.get(phone)
+                    if lead is None:
+                        continue
+                    if time.time() - lead.get("last_seen", time.time()) <= STALE_TIME:
+                        continue
+                    if lead.get("followup_sent", False):
+                        continue
                     chat = chat_sessions.get(phone)
                     if chat is None:
                         # Сессии в памяти нет (например, сервер перезапускался) —
@@ -638,11 +692,11 @@ def check_stale_leads():
                 try:
                     gemini_rate_limiter.acquire()
                     response = chat.send_message(prompt)
-                    reply_text = getattr(
-                        response,
-                        "text",
-                        "Если что, я здесь и могу помочь по вашему объекту.",
-                    )
+                    # у response.text дефолт "" уже есть — getattr с фолбэком не
+                    # сработал бы; явно проверяем пустоту
+                    reply_text = (getattr(response, "text", "") or "").strip()
+                    if not reply_text:
+                        reply_text = "Если что, я здесь и могу помочь по вашему объекту."
 
                     send_whatsapp_message(phone, reply_text)
                     log_chat_to_file(phone, "ИИ-Бот (Follow-up)", reply_text)

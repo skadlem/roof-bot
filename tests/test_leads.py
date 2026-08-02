@@ -209,7 +209,8 @@ def test_create_lead_missing_phone_falls_back_to_client(main, outbox, sheets, ge
 
 
 def test_sheets_failure_tolerated(main, outbox, gemini, monkeypatch):
-    """Google Sheets упал — сообщение обрабатывается, бот не падает."""
+    """Google Sheets упал — бот не падает: владелец не уведомляется, лид
+    остаётся открытым, клиенту уходит сообщение об ошибке сохранения."""
     def boom():
         raise RuntimeError("google sheets is down")
 
@@ -221,7 +222,11 @@ def test_sheets_failure_tolerated(main, outbox, gemini, monkeypatch):
 
     main.process_gemini_response(phone, user_message="Заказываю")
 
-    # клиенту ответ ушёл, владелец уведомлён, лид закрыт — как в штатном сценарии
+    # владелец НЕ уведомлён (лида в таблице нет — уведомлять не о чем)
+    assert not any(x[0] == "template" for x in outbox)
+    # лид НЕ закрыт: таблица недоступна, сессия остаётся — клиент повторит позже
+    assert phone in main.open_leads
+    assert phone in main.chat_sessions
+    # модель получила ошибку сохранения и передала её клиенту
+    assert _lead_result(gemini).startswith("Ошибка:")
     assert any(x[0] == "text" and x[1] == phone for x in outbox)
-    assert any(x[0] == "template" for x in outbox)
-    assert phone not in main.open_leads
