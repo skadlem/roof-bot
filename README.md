@@ -76,7 +76,7 @@ Idempotent: re-running only re-embeds changed sources (per-source sha256). Sheet
 
 ```bash
 venv\Scripts\python.exe -m rag.retrieve "how much does metal tile cost" <client_id>
-venv\Scripts\python.exe -m rag.ask "how much does metal tile cost" <client_id>      # step-2 flow: context → Gemini answer + sources (no tools)
+venv\Scripts\python.exe -m rag.ask "how much does metal tile cost" <client_id>      # step-2 flow: context → Gemini answer (no tools)
 venv\Scripts\python.exe -m rag.agent_cli <client_id>                                # agent loop: multi-turn REPL, prints every tool call
 ```
 

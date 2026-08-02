@@ -11,7 +11,7 @@ The bot answers factual questions (services, timelines, delivery areas, guarante
 
 ## What to fill in
 
-Real facts only. Every fact below is currently a placeholder (`<!-- ЗАПОЛНИТЬ: ... -->`) and is ignored by the build until you replace it with text:
+Real facts only. The current `kb/faq.md` is filled with **fake demo data** (services, timelines, delivery, guarantees, materials) so the bot can be tested on real phone numbers. Replace it with real company facts before production — anything you write here is what the bot promises to customers:
 
 - **Services** — монтаж кровли, замена, ремонт, под ключ, что входит в работу.
 - **Mounting timelines** — сколько дней занимает типовой объект, от чего зависит срок.
@@ -25,9 +25,9 @@ Anything you write here is what the bot promises to customers — if you don't f
 ## Rebuild after editing
 
 ```bash
-venv\Scripts\python.exe build_kb.py
+venv\Scripts\python.exe -m rag.ingest
 ```
 
-Requires `GOOGLE_API_KEY` (or `GEMINI_API_KEY`) in `.env`. The build chunks every `kb/*.md`, embeds the chunks, and writes `kb_embeddings.json` (gitignored). The bot picks the file up on the next restart.
+Requires `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in `.env`. The ingest chunks every `kb/*.md`, embeds the chunks, and writes them into `chroma_db/` (gitignored). It is idempotent: re-running only re-embeds changed files. The bot picks the change up immediately.
 
 If the knowledge base is empty or the file is missing, retrieval is disabled and the bot falls back to the safe behavior: it never invents prices, services, timelines, delivery zones, or guarantees.
