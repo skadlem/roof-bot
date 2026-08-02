@@ -1,0 +1,14 @@
+# secrets
+.env
+.env.txt
+google_credentials.json
+
+# runtime data (leads, chat history, phone numbers)
+chats_logs/
+open_leads.json
+seen_messages.json
+
+# python
+venv/
+__pycache__/
+*.pyc
