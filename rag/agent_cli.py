@@ -14,8 +14,10 @@ from dotenv import load_dotenv
 from rag.agent import DEFAULT_SYSTEM_PROMPT, get_model, run_agent
 from rag.prompts import RAG_SIMILARITY_THRESHOLD
 
-# консоль Windows (cp1252) не умеет кириллицу в print
+# консоль Windows (cp1252) не умеет кириллицу в print; stdin тоже перекодируем,
+# иначе ввод из файла/пайпа (UTF-8) превращается в мусор до попадания в агента
 sys.stdout.reconfigure(encoding="utf-8")
+sys.stdin.reconfigure(encoding="utf-8")
 
 
 def _record_lead_stub(order_data):

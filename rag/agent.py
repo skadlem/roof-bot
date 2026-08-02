@@ -320,4 +320,9 @@ def run_agent(chat, client_id, *, user_message=None, audio_data=None,
         response = chat.send_message(genai.protos.Content(parts=feedback))
 
     result.text = getattr(response, "text", None) or ""
+    # Лид сохранён, а текст не пришёл (модель позвала create_lead последним
+    # ходом и цикл исчерпал MAX_TURNS) — клиенту нужен ответ, а не "ошибка":
+    # заявка уже в таблице, сессию закроет вызывающий код по lead_saved.
+    if result.lead_saved and not result.text:
+        result.text = "Заявка принята. Спасибо, менеджер скоро свяжется с вами."
     return result
