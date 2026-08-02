@@ -1,15 +1,15 @@
 # Roof Bot
 
-WhatsApp-бот для приёма заявок на монтаж кровли. Отвечает клиенту на русском, собирает данные о заявке (тип кровли, площадь, телефон), сохраняет лидов и отправляет follow-up по «тёплым» лидам.
+WhatsApp bot for roofing installation leads. Talks to customers in Russian, collects lead details (roofing type, area, phone number), saves leads and sends follow-ups to warm leads.
 
-## Как работает
+## How it works
 
-- **WhatsApp Cloud API** (Meta) — приём/отправка сообщений через вебхук
-- **Gemini API** — ИИ-диалог с клиентом
-- **Google Sheets (gspread)** — запись заявок
-- **APScheduler** — follow-up для лидов без ответа
+- **WhatsApp Cloud API** (Meta) — receiving/sending messages via webhook
+- **Gemini API** — AI conversation with the customer
+- **Google Sheets (gspread)** — lead export
+- **APScheduler** — follow-ups for unanswered leads
 
-## Установка
+## Installation
 
 ```bash
 python -m venv venv
@@ -17,32 +17,32 @@ venv\Scripts\activate        # Windows
 pip install -r requirements.txt
 ```
 
-## Настройка
+## Setup
 
-1. Скопируйте `.env` — все секреты берутся из него (см. `.env.example`):
-   - `GEMINI_API_KEY` — ключ Google Gemini
-   - `WA_TOKEN`, `WA_PHONE_ID`, `WA_VERIFY_TOKEN`, `WA_APP_SECRET` — настройки WhatsApp Cloud API
-   - `OWNER_PHONE_NUMBER` — телефон владельца, куда дублируются заявки
-2. Поместите `google_credentials.json` (сервисный аккаунт Google Sheets) в корень репозитория.
+1. Copy `.env.example` to `.env` and fill in the values:
+   - `GEMINI_API_KEY` — Google Gemini key
+   - `WA_TOKEN`, `WA_PHONE_ID`, `WA_VERIFY_TOKEN`, `WA_APP_SECRET` — WhatsApp Cloud API settings
+   - `OWNER_PHONE_NUMBER` — owner's phone number, leads are duplicated to it
+2. Place `google_credentials.json` (Google Sheets service account) in the repo root.
 
-## Запуск
+## Run
 
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Вебхук WhatsApp указывается на `https://<ваш-домен>/webhook`.
+Point the WhatsApp webhook at `https://<your-domain>/webhook`.
 
-## Файлы данных
+## Data files
 
-Создаются при работе бота и **не попадают в git** (в `.gitignore`):
+Created at runtime and **not tracked by git** (in `.gitignore`):
 
-| Файл | Содержимое |
+| File | Contents |
 |---|---|
-| `open_leads.json` | Открытые лиды с историей переписки |
-| `seen_messages.json` | ID обработанных сообщений |
-| `chats_logs/` | Журналы переписок по номерам телефонов |
+| `open_leads.json` | Open leads with chat history |
+| `seen_messages.json` | Processed message IDs |
+| `chats_logs/` | Per-phone-number chat logs |
 
-## Важно
+## Note
 
-Файлы данных содержат персональные данные клиентов (номера телефонов, переписку) — не публикуйте их.
+Data files contain customer personal data (phone numbers, conversations) — do not publish them.
