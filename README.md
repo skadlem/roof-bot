@@ -112,7 +112,13 @@ $env:GEMINI_RPM = "10"          # PowerShell: keep under the free-tier 15 rpm bu
 venv\Scripts\python.exe -m evals.run_evals
 ```
 
-Prints a pass-rate table (overall and per kb/tools group) and the worst failed cases. Exit code 1 if grounded or correct is below 70%, 2 if cases couldn't be evaluated. Current: **grounded 100%, correct 100% (24 cases), exit 0**. The judge sees the same three sources the bot uses: retrieved KB chunks, the price list (from `prices.json`), and tool results.
+Prints a pass-rate table (overall and per kb/tools group) and the worst failed cases. Exit code 1 if grounded or correct is below 70%, 2 if cases couldn't be evaluated. The judge sees the same three sources the bot uses: retrieved KB chunks, the price list (from `prices.json`), and tool results. Current:
+
+```
+grounded: 100%  correct: 100%  (из 24 кейсов)
+  kb   : grounded 100%  correct 100%  (n=5)
+  tools: grounded 100%  correct 100%  (n=19)
+```
 
 ## Testing
 
