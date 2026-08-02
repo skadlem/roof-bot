@@ -56,6 +56,7 @@ pip install -r requirements.txt
 
 1. Copy `.env.example` to `.env` and fill in the values:
    - `GEMINI_API_KEY` — Google Gemini key
+   - `SHEET_KEY` — ID of the Google Sheet used for order export and RAG ingestion
    - `WA_TOKEN`, `WA_PHONE_ID`, `WA_VERIFY_TOKEN`, `WA_APP_SECRET` — WhatsApp Cloud API settings
    - `OWNER_PHONE_NUMBER` — owner's phone number, leads are duplicated to it
 2. Place `google_credentials.json` (Google Sheets service account) in the repo root.
@@ -63,13 +64,27 @@ pip install -r requirements.txt
 
 ## Knowledge base (RAG)
 
-The bot answers factual questions (services, timelines, delivery areas, guarantees) from `kb/*.md` instead of guessing. Write real facts there — one topic per file, one fact per paragraph (see `kb/README.md` for the format and what to fill in), then rebuild:
+Two pipelines feed the bot. Write real facts in `kb/*.md` — one topic per file, one fact per paragraph (see `kb/README.md` for the format and what to fill in).
+
+**`rag/` (new)** — chunks `kb/*.md` and your Google Sheets orders, embeds them with Gemini (`gemini-embedding-2`), and stores everything in a persistent ChromaDB store (`chroma_db/`, gitignored):
+
+```bash
+venv\Scripts\python.exe -m rag.ingest
+```
+
+Idempotent: re-running only re-embeds changed sources (per-source sha256). Sheet rows get `client_id = phone`; kb facts are shared across all clients. Query it with:
+
+```bash
+venv\Scripts\python.exe -m rag.retrieve "how much does metal tile cost" <client_id>
+```
+
+Needs `GEMINI_API_KEY` and `SHEET_KEY` in `.env`, plus `google_credentials.json`. This pipeline is not wired into the bot yet — it's the replacement for `build_kb.py`.
+
+**`build_kb.py` (current runtime)** — chunks the same `kb/*.md` files and writes `kb_embeddings.json` (gitignored). The bot loads it at startup and sends the closest facts to Gemini as context for text messages:
 
 ```bash
 venv\Scripts\python.exe build_kb.py
 ```
-
-The build chunks the files, embeds them (needs `GOOGLE_API_KEY` or `GEMINI_API_KEY` in `.env`), and writes `kb_embeddings.json` (gitignored). The bot loads it at startup and sends the closest facts to Gemini as context for text messages.
 
 If the knowledge base is missing or empty, retrieval is disabled: the bot never invents prices, services, timelines, delivery zones, or guarantees — it says it will check with a manager. Voice messages never trigger retrieval.
 
@@ -99,6 +114,8 @@ Created at runtime and **not tracked by git** (in `.gitignore`):
 | `open_leads.json` | Open leads with chat history |
 | `seen_messages.json` | Processed message IDs |
 | `chats_logs/` | Per-phone-number chat logs |
+| `chroma_db/` | RAG vector store (rebuild with `python -m rag.ingest`) |
+| `kb_embeddings.json` | Legacy RAG store (rebuild with `build_kb.py`) |
 
 ## Note
 
