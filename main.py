@@ -262,7 +262,8 @@ def get_sheet():
     with _sheet_lock:
         if _sheet is None:
             gc = gspread.service_account(filename="google_credentials.json")
-            _sheet = gc.open_by_key("11vKc3-d5zhX1-0wnua3blinCh4R6RJBi555JOhHz218").sheet1
+            # ключ из .env (SHEET_KEY); фолбэк для локального запуска без .env
+            _sheet = gc.open_by_key(os.getenv("SHEET_KEY", "11vKc3-d5zhX1-0wnua3blinCh4R6RJBi555JOhHz218")).sheet1
         return _sheet
 
 

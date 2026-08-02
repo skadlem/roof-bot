@@ -11,6 +11,9 @@ seen_messages.json
 # knowledge base build output (rebuild with venv\Scripts\python.exe build_kb.py)
 kb_embeddings.json
 
+# rag vector store (rebuild with venv\Scripts\python.exe -m rag.ingest)
+chroma_db/
+
 # python
 venv/
 __pycache__/
