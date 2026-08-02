@@ -36,7 +36,7 @@ def test_same_phone_messages_processed_serially(main, monkeypatch):
     assert tracker.max_active == 1
 
 
-def test_different_phones_processed_in_parallel(main, monkeypatch):
+def test_different_phones_processed_in_parallel(main, monkeypatch, outbox):
     """Разные клиенты обрабатываются параллельно, а не по очереди."""
     tracker = _run_in_threads(main, monkeypatch, ["77001234567", "77001112233"])
 

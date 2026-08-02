@@ -6,6 +6,7 @@ import pytest
 import google.generativeai as genai
 
 import rag.agent
+import rag.retrieve
 from tests.helpers import FakeChat, FakeModel
 
 
@@ -90,7 +91,7 @@ def main(sandbox):
 
 
 @pytest.fixture(autouse=True)
-def clean_state(main):
+def clean_state(main, monkeypatch):
     """Чистое состояние между тестами: лиды, сессии, seen-сообщения, таблица, лимитер."""
     with main.state_lock:
         main.open_leads.clear()
@@ -101,6 +102,11 @@ def clean_state(main):
     main.gemini_rate_limiter = _NoLimit()
     # агент-цикл лимитирует обращения через свой модульный инстанс (main его импортирует)
     rag.agent.gemini_rate_limiter = _NoLimit()
+    # retrieve ходит в сеть за эмбеддингами (genai.embed_content), даже когда база
+    # пустая, как в sandbox. Заглушка: контекст = пусто, как и отдала бы пустая
+    # база — но без HTTP. Иначе сетевой джиттер ронял concurrency-тесты: потоки
+    # разъезжались на round-trip раньше, чем попадали в 0.15s-окно замера.
+    monkeypatch.setattr(rag.retrieve, "retrieve", lambda *a, **k: [])
     main.scheduler = _DummyScheduler()
     yield
 
