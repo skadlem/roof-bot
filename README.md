@@ -40,7 +40,7 @@ Customer ──▶ WhatsApp Cloud API ──▶ FastAPI webhook ──▶ Gemini
 
 - **FastAPI** — webhook endpoint, signature verification, message dedup
 - **WhatsApp Cloud API (Meta)** — send/receive messages, download voice audio
-- **Gemini API** — the sales brain: an agent loop (up to 3 turns per message) with two tools, driven by a full system-prompt sales script
+- **Gemini API** — the sales brain: a LangGraph agent loop (up to 3 turns per message) with two tools, driven by a full system-prompt sales script
 - **Google Sheets (gspread)** — lead export
 - **APScheduler** — 4-hour follow-up for unanswered leads
 
@@ -104,7 +104,7 @@ Session state (model + system prompt + history) lives in `ChatSession`; the whol
 Two tools:
 
 - `lookup_pricing(service)` — exact price per m² from `prices.json`, the same live file embedded in the system prompt (the copy in `kb/faq.md` is stale). The model is told to quote prices only through this tool.
-- `create_lead(name, service, message)` — appends the lead row to the Google Sheet. The phone is optional: if the model doesn't pass one, the customer's own WhatsApp number is used (validated 7–15 digits). The prompt is hardened so an order means the call: name + material + area in the message counts as an order — no asking for confirmation, no "the manager will call you" without the call. A validation error goes back to the model to relay — a bad lead never reaches the sheet and the conversation stays open. A saved lead closes the session.
+- `create_lead(name, service, message)` — appends the lead row to the Google Sheet. The phone is optional: if the model doesn't pass one, the customer's own WhatsApp number is used (validated 7–15 digits). The prompt is hardened so an order means the call: name + material + area in the message counts as an order — no asking for confirmation, and no "the manager will call you" at all: after `create_lead` the confirmation with the total is the close. A validation error goes back to the model to relay — a bad lead never reaches the sheet and the conversation stays open. A saved lead closes the session.
 
 ## Run
 
